@@ -492,6 +492,54 @@ export default function Home() {
     }
   }
 
+  async function handleHtmlImport(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // Reset input value to allow uploading the same file again
+    e.target.value = "";
+
+    if (!file.name.endsWith(".html")) {
+      setError("Please select a valid exported HTML bookmark file.");
+      return;
+    }
+
+    if (file.size > 2 * 1024 * 1024) {
+      setError("Import file exceeds the 2MB size limit.");
+      return;
+    }
+
+    setLoading(true);
+    setError("");
+
+    try {
+      const token = await getToken();
+      const formData = new FormData();
+      formData.append("file", file);
+
+      const res = await fetch(`${API_BASE}/bookmarks/import`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token}`
+        },
+        body: formData
+      });
+
+      if (!res.ok) {
+        const errData = await res.json();
+        throw new Error(errData.detail || "Bulk import failed.");
+      }
+
+      const resData = await res.json();
+      fetchBookmarks();
+      alert(resData.message);
+    } catch (err: any) {
+      setError(err.message || "Failed to parse and import bookmark file.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   function openEdit(bookmark: Bookmark) {
     setTitle(bookmark.title);
     setUrl(bookmark.url);
@@ -770,6 +818,61 @@ export default function Home() {
               </span>
             </button>
           ))}
+        </div>
+
+        {/* Ingestion & Tools */}
+        <div style={{ padding: "16px", borderTop: "1px solid var(--border)" }}>
+          <div style={{ fontSize: "11px", color: "var(--text-muted)", marginBottom: "10px", fontWeight: 600, letterSpacing: "0.05em" }}>INGESTION & TOOLS</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+            {/* Bookmarklet Drag-and-Drop Badge */}
+            <a
+              href="javascript:(function(){var w=500,h=380,left=(screen.width/2)-(w/2),top=(screen.height/2)-(h/2),u=window.location.href,t=document.title;var p=window.open('http://localhost:3000/bookmarklet?url='+encodeURIComponent(u)+'&title='+encodeURIComponent(t),'Save Bookmark','width='+w+',height='+h+',top='+top+',left='+left+',scrollbars=no,resizable=no');if(!p||p.closed||typeof p.closed=='undefined'){alert('Popup blocked! Please allow popups for this site to use the Bookmarklet.');}else if(window.focus){p.focus()}})();"
+              onClick={e => {
+                // Prevent navigation when clicking, but allow dragging
+                if (e.button === 0) {
+                  alert("Drag this link to your browser bookmarks bar to save pages with one click!");
+                  e.preventDefault();
+                }
+              }}
+              style={{
+                display: "flex", alignItems: "center", gap: "8px",
+                padding: "8px 12px", background: "rgba(139,92,246,0.1)",
+                border: "1px dashed rgba(139,92,246,0.3)", borderRadius: "10px",
+                color: "#a78bfa", fontSize: "12px", textDecoration: "none",
+                fontWeight: 500, cursor: "grab", justifyContent: "center",
+                transition: "all 0.15s"
+              }}
+              title="Drag me to your bookmark bar!"
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
+              </svg>
+              Drag to Bookmark Bar
+            </a>
+
+            {/* HTML Import Uploader */}
+            <label
+              style={{
+                display: "flex", alignItems: "center", gap: "8px",
+                padding: "8px 12px", background: "var(--surface)",
+                border: "1px solid var(--border)", borderRadius: "10px",
+                color: "var(--text-secondary)", fontSize: "12px",
+                fontWeight: 500, cursor: "pointer", justifyContent: "center",
+                transition: "all 0.15s"
+              }}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" />
+              </svg>
+              Import HTML file
+              <input
+                type="file"
+                accept=".html"
+                onChange={handleHtmlImport}
+                style={{ display: "none" }}
+              />
+            </label>
+          </div>
         </div>
 
         {/* Stats footer */}

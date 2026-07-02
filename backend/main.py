@@ -7,8 +7,9 @@ from datetime import datetime
 from typing import List
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from bs4 import BeautifulSoup
 from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, text
@@ -677,3 +678,103 @@ async def chat_with_vault(
         raise HTTPException(status_code=500, detail="AI generation failed.")
 
     return {"response": ai_reply, "sources": sources}
+
+
+@app.post("/bookmarks/import")
+async def import_bookmarks_html(
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user)
+):
+    # 1. Enforce 2MB size limit (DoS & memory lock protection)
+    MAX_SIZE = 2 * 1024 * 1024  # 2MB
+    content_bytes = await file.read(MAX_SIZE + 1)
+    if len(content_bytes) > MAX_SIZE:
+        raise HTTPException(status_code=400, detail="Import file exceeds the 2MB size limit.")
+
+    try:
+        content = content_bytes.decode("utf-8", errors="ignore")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid file encoding")
+
+    soup = BeautifulSoup(content, "html.parser")
+    links = soup.find_all("a")
+
+    imported_count = 0
+    skipped_count = 0
+
+    # Limit to 100 links per import to prevent system/AI API rate limits overload
+    targets = links[:100]
+    
+    bookmarks_to_create = []
+    
+    for link in targets:
+        url = link.get("href")
+        if not url:
+            continue
+        
+        url_str = url.strip()
+        # Enforce strict checks against relative paths, anchor hashes, and local protocols
+        if url_str.startswith(("/", "#", "javascript:", "mailto:")):
+            skipped_count += 1
+            continue
+
+        parsed_url = urlparse(url_str)
+        if not parsed_url.scheme:
+            url_str = "https://" + url_str
+            parsed_url = urlparse(url_str)
+        
+        if parsed_url.scheme.lower() not in ["http", "https"]:
+            skipped_count += 1
+            continue
+
+        title = link.text.strip() or url_str
+
+        # Check duplicates for user
+        exists = db.query(Bookmark).filter(Bookmark.url == url_str, Bookmark.user_id == user_id).first()
+        if exists:
+            skipped_count += 1
+            continue
+
+        bookmark = Bookmark(
+            user_id=user_id,
+            title=title,
+            url=url_str,
+            category="Other",
+            status="processing",
+            summary="Queued for bulk AI analysis..."
+        )
+        bookmarks_to_create.append(bookmark)
+
+    if not bookmarks_to_create:
+        return {
+            "message": f"No new bookmarks to import. Skipped {skipped_count} invalid or duplicate links.",
+            "imported": 0,
+            "skipped": skipped_count,
+            "limited": len(links) > 100
+        }
+
+    # 2. Transaction Commit Optimization: Grouped commit
+    try:
+        db.add_all(bookmarks_to_create)
+        db.commit()
+        for b in bookmarks_to_create:
+            db.refresh(b)
+        imported_count = len(bookmarks_to_create)
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed bulk import transaction commit: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Database transaction failed during bulk import.")
+
+    # 3. Async Background Task Scheduling
+    if background_tasks:
+        for b in bookmarks_to_create:
+            background_tasks.add_task(enrich_bookmark_task, b.id, db)
+
+    return {
+        "message": f"Successfully imported {imported_count} bookmarks. Skipped {skipped_count} duplicates/invalid links.",
+        "imported": imported_count,
+        "skipped": skipped_count,
+        "limited": len(links) > 100
+    }
