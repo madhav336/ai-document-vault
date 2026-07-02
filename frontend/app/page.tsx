@@ -888,6 +888,7 @@ export default function Home() {
 
   const bookmarkletHost = isMounted ? window.location.origin : "http://localhost:3000";
   const bookmarkletHref = `javascript:(function(){var w=500,h=380,left=(screen.width/2)-(w/2),top=(screen.height/2)-(h/2),u=window.location.href,t=document.title;var p=window.open('${bookmarkletHost}/bookmarklet?url='+encodeURIComponent(u)+'&title='+encodeURIComponent(t),'Save Bookmark','width='+w+',height='+h+',top='+top+',left='+left+',scrollbars=no,resizable=no');if(!p||p.closed||typeof p.closed=='undefined'){alert('Popup blocked! Please allow popups for this site to use the Bookmarklet.');}else if(window.focus){p.focus()}})();`;
+  const bookmarkletHtml = `<a href="${bookmarkletHref}" onclick="if(event.button === 0){ alert('Drag this link to your browser bookmarks bar to save pages with one click!'); event.preventDefault(); }" style="display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: rgba(139,92,246,0.1); border: 1px dashed rgba(139,92,246,0.3); border-radius: 10px; color: #a78bfa; font-size: 12px; text-decoration: none; font-weight: 500; cursor: grab; justify-content: center; transition: all 0.15s; user-select: none; -webkit-user-select: none; -moz-user-select: none; -ms-user-select: none; width: 100%; box-sizing: border-box;" title="Drag me to your bookmark bar!"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 4px; display: inline-block; vertical-align: middle;"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" /></svg>Drag to Bookmark Bar</a>`;
 
   return (
     <>
@@ -1084,45 +1085,11 @@ export default function Home() {
           <div style={{ fontSize: "11px", color: "var(--text-muted)", marginBottom: "10px", fontWeight: 600, letterSpacing: "0.05em" }}>INGESTION & TOOLS</div>
           <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
             {/* Bookmarklet Drag-and-Drop Badge */}
-            <div id="bookmarklet-badge" style={{ width: "100%" }}>
-              <a
-                href={bookmarkletHref}
-                onClick={e => {
-                  if (e.button === 0) {
-                    alert("Drag this link to your browser bookmarks bar to save pages with one click!");
-                    e.preventDefault();
-                  }
-                }}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "8px",
-                  padding: "8px 12px",
-                  background: "rgba(139,92,246,0.1)",
-                  border: "1px dashed rgba(139,92,246,0.3)",
-                  borderRadius: "10px",
-                  color: "#a78bfa",
-                  fontSize: "12px",
-                  textDecoration: "none",
-                  fontWeight: 500,
-                  cursor: "grab",
-                  justifyContent: "center",
-                  transition: "all 0.15s",
-                  userSelect: "none",
-                  WebkitUserSelect: "none",
-                  MozUserSelect: "none",
-                  msUserSelect: "none",
-                  width: "100%",
-                  boxSizing: "border-box"
-                }}
-                title="Drag me to your bookmark bar!"
-              >
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.8" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: "4px", display: "inline-block", verticalAlign: "middle" }}>
-                  <path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
-                </svg>
-                Drag to Bookmark Bar
-              </a>
-            </div>
+            <div
+              id="bookmarklet-badge"
+              style={{ width: "100%" }}
+              dangerouslySetInnerHTML={{ __html: bookmarkletHtml }}
+            />
 
             {/* HTML Import Uploader */}
             <label
