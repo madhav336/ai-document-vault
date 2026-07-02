@@ -184,10 +184,16 @@ export default function Home() {
 
   async function addBookmark() {
     if (!title.trim() || !url.trim()) { setError("Please enter both title and URL."); return; }
-    try { new URL(url); } catch { setError("Please enter a valid URL (e.g. https://example.com)."); return; }
+    
+    let normalizedUrl = url.trim();
+    if (!normalizedUrl.includes("://")) {
+      normalizedUrl = "https://" + normalizedUrl;
+    }
+    
+    try { new URL(normalizedUrl); } catch { setError("Please enter a valid URL (e.g. https://example.com)."); return; }
     
     const originalTitle = title;
-    const originalUrl = url;
+    const originalUrl = normalizedUrl;
     const originalCategory = selectedCategory;
     const optimisticId = -Date.now();
 
@@ -243,12 +249,19 @@ export default function Home() {
 
   async function updateBookmark() {
     if (!title.trim() || !url.trim()) { setError("Please enter both title and URL."); return; }
-    try { new URL(url); } catch { setError("Please enter a valid URL (e.g. https://example.com)."); return; }
+    
+    let normalizedUrl = url.trim();
+    if (!normalizedUrl.includes("://")) {
+      normalizedUrl = "https://" + normalizedUrl;
+    }
+    
+    try { new URL(normalizedUrl); } catch { setError("Please enter a valid URL (e.g. https://example.com)."); return; }
+    
     if (editingId === null) return;
 
     const targetId = editingId;
     const originalTitle = title;
-    const originalUrl = url;
+    const originalUrl = normalizedUrl;
     const originalCategory = selectedCategory;
 
     const currentBookmark = bookmarks.find(b => b.id === targetId);
