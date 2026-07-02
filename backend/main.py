@@ -1,6 +1,7 @@
 import json
 import os
 import time
+import asyncio
 import threading
 import logging
 from datetime import datetime
@@ -266,24 +267,33 @@ async def generate_summary(title: str, url: str, scraped_text: str | None = None
     - summary: A concise 2-3 sentence description of what this resource is about.
     - category: Exactly one value from this list: {", ".join(VALID_CATEGORIES)}
     """
-    try:
-        response = await client.aio.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=BookmarkAI,
-                temperature=0.0,
-            ),
-        )
-        data = json.loads(response.text)
-        # Validate that the returned category is one we recognise
-        if data.get("category") not in VALID_CATEGORIES:
-            data["category"] = "Other"
-        return data
-    except Exception as e:
-        print("AI Summary error:", e)
-        return {"summary": "Summary unavailable.", "category": "Other"}
+    max_retries = 3
+    delay = 1.0
+    for attempt in range(max_retries):
+        try:
+            response = await client.aio.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=BookmarkAI,
+                    temperature=0.0,
+                ),
+            )
+            data = json.loads(response.text)
+            if data.get("category") not in VALID_CATEGORIES:
+                data["category"] = "Other"
+            return data
+        except Exception as e:
+            error_str = str(e)
+            is_transient = "503" in error_str or "429" in error_str or "unavailable" in error_str.lower()
+            if is_transient and attempt < max_retries - 1:
+                logger.warning(f"Transient Gemini error (attempt {attempt+1}/{max_retries}): {e}. Retrying in {delay}s...")
+                await asyncio.sleep(delay)
+                delay *= 2
+            else:
+                logger.error(f"AI Summary failure on attempt {attempt+1}: {e}", exc_info=True)
+                raise e
 
 # ── Background Worker Task ───────────────────────────────────────────────────
 
