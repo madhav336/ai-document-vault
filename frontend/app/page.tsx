@@ -167,6 +167,7 @@ export default function Home() {
   const [chatInput, setChatInput] = useState("");
   const [isChatLoading, setIsChatLoading] = useState(false);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
+  const bookmarkletRef = useRef<HTMLAnchorElement | null>(null);
   
   const { getToken } = useAuth();
 
@@ -179,6 +180,15 @@ export default function Home() {
   const [isMounted, setIsMounted] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+
+  useEffect(() => {
+    if (bookmarkletRef.current) {
+      bookmarkletRef.current.setAttribute(
+        "href",
+        "javascript:(function(){var w=500,h=380,left=(screen.width/2)-(w/2),top=(screen.height/2)-(h/2),u=window.location.href,t=document.title;var p=window.open('http://localhost:3000/bookmarklet?url='+encodeURIComponent(u)+'&title='+encodeURIComponent(t),'Save Bookmark','width='+w+',height='+h+',top='+top+',left='+left+',scrollbars=no,resizable=no');if(!p||p.closed||typeof p.closed=='undefined'){alert('Popup blocked! Please allow popups for this site to use the Bookmarklet.');}else if(window.focus){p.focus()}})();"
+      );
+    }
+  }, [isMounted]);
 
   useEffect(() => {
     const timer = setTimeout(() => setIsMounted(true), 0);
@@ -826,7 +836,7 @@ export default function Home() {
           <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
             {/* Bookmarklet Drag-and-Drop Badge */}
             <a
-              href="javascript:(function(){var w=500,h=380,left=(screen.width/2)-(w/2),top=(screen.height/2)-(h/2),u=window.location.href,t=document.title;var p=window.open('http://localhost:3000/bookmarklet?url='+encodeURIComponent(u)+'&title='+encodeURIComponent(t),'Save Bookmark','width='+w+',height='+h+',top='+top+',left='+left+',scrollbars=no,resizable=no');if(!p||p.closed||typeof p.closed=='undefined'){alert('Popup blocked! Please allow popups for this site to use the Bookmarklet.');}else if(window.focus){p.focus()}})();"
+              ref={bookmarkletRef}
               onClick={e => {
                 // Prevent navigation when clicking, but allow dragging
                 if (e.button === 0) {
