@@ -148,6 +148,7 @@ export default function Home() {
     try {
       const targetArchived = archivedOverride !== undefined ? archivedOverride : showArchived;
       const token = await getToken();
+      if (!token) return;
       const res = await fetch(`${API_BASE}/bookmarks?archived=${targetArchived}`, {
         headers: { Authorization: `Bearer ${token}` }
       });
@@ -166,6 +167,7 @@ export default function Home() {
     if (!query.trim()) { fetchBookmarks(); return; }
     try {
       const token = await getToken();
+      if (!token) return;
       const res = await fetch(`${API_BASE}/search?q=${query}`, {
         headers: { Authorization: `Bearer ${token}` }
       });
