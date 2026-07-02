@@ -645,6 +645,21 @@ export default function Home() {
     }
   }, [bookmarks, fetchBookmarks]);
 
+  // Sync bookmarks instantly in real-time across tabs/popup bookmarklet
+  useEffect(() => {
+    try {
+      const bc = new BroadcastChannel("bookmark_vault_sync");
+      bc.onmessage = (event) => {
+        if (event.data?.type === "BOOKMARK_ADDED") {
+          fetchBookmarks();
+        }
+      };
+      return () => bc.close();
+    } catch (err) {
+      console.error("Failed to initialize BroadcastChannel sync:", err);
+    }
+  }, [fetchBookmarks]);
+
   // Close dialog on ESC key
   useEffect(() => {
     function onKey(e: KeyboardEvent) { if (e.key === "Escape") closeDialog(); }

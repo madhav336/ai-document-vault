@@ -48,6 +48,13 @@ function BookmarkletContent() {
       }
 
       setStatus("success");
+      try {
+        const bc = new BroadcastChannel("bookmark_vault_sync");
+        bc.postMessage({ type: "BOOKMARK_ADDED" });
+        bc.close();
+      } catch (err) {
+        console.error("Broadcast failed:", err);
+      }
       setTimeout(() => {
         window.close();
       }, 1500);
