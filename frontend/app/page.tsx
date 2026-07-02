@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import { Show, SignInButton, UserButton, useAuth } from "@clerk/nextjs";
 
 type Bookmark = {
@@ -10,6 +10,8 @@ type Bookmark = {
   summary: string;
   category: string;
   created_at: string;
+  status?: string;
+  is_archived?: boolean;
 };
 
 function timeAgo(dateStr: string): string {
@@ -73,20 +75,28 @@ export default function Home() {
   const [activeCategory, setActiveCategory] = useState("All");
   // null = "Auto (AI)" — let backend Gemini decide
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
+  const [showArchived, setShowArchived] = useState(false);
   
   const { getToken } = useAuth();
   
+  const [isMounted, setIsMounted] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
 
   useEffect(() => {
+    const timer = setTimeout(() => setIsMounted(true), 0);
     function checkRes() {
       setIsMobile(window.innerWidth <= 768);
     }
     checkRes();
     window.addEventListener("resize", checkRes);
-    return () => window.removeEventListener("resize", checkRes);
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener("resize", checkRes);
+    };
   }, []);
+
+  const showMobileUI = isMounted && isMobile;
   
   // ── Swipe-to-refresh Touch Gesture Hooks ─────────────────────────────────
   const [touchStart, setTouchStart] = useState<number | null>(null);
@@ -134,10 +144,11 @@ export default function Home() {
     }
   }
 
-  async function fetchBookmarks() {
+  const fetchBookmarks = useCallback(async (archivedOverride?: boolean) => {
     try {
+      const targetArchived = archivedOverride !== undefined ? archivedOverride : showArchived;
       const token = await getToken();
-      const res = await fetch(`${API_BASE}/bookmarks`, {
+      const res = await fetch(`${API_BASE}/bookmarks?archived=${targetArchived}`, {
         headers: { Authorization: `Bearer ${token}` }
       });
       const data = await res.json();
@@ -149,9 +160,9 @@ export default function Home() {
     } catch {
       setBookmarks([]);
     }
-  }
+  }, [getToken, showArchived]);
 
-  async function searchBookmarks(query: string) {
+  const searchBookmarks = useCallback(async (query: string) => {
     if (!query.trim()) { fetchBookmarks(); return; }
     try {
       const token = await getToken();
@@ -167,13 +178,37 @@ export default function Home() {
     } catch {
       setBookmarks([]);
     }
-  }
+  }, [getToken, fetchBookmarks]);
 
   async function addBookmark() {
     if (!title.trim() || !url.trim()) { setError("Please enter both title and URL."); return; }
     try { new URL(url); } catch { setError("Please enter a valid URL (e.g. https://example.com)."); return; }
+    
+    const originalTitle = title;
+    const originalUrl = url;
+    const originalCategory = selectedCategory;
+    const optimisticId = -Date.now();
+
+    const optimisticBookmark: Bookmark = {
+      id: optimisticId,
+      title: originalTitle || "New Bookmark",
+      url: originalUrl,
+      summary: "AI is analyzing...",
+      category: originalCategory || "Other",
+      created_at: new Date().toISOString(),
+      status: "processing"
+    };
+
+    // Close dialog and clear inputs instantly
+    setIsDialogOpen(false);
+    setTitle(""); 
+    setUrl("");
+    setSelectedCategory(null);
     setError("");
-    setLoading(true);
+
+    // Optimistically prepend to list
+    setBookmarks(prev => [optimisticBookmark, ...prev]);
+
     try {
       const token = await getToken();
       const res = await fetch(`${API_BASE}/bookmarks`, {
@@ -182,64 +217,88 @@ export default function Home() {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${token}` 
         },
-        body: JSON.stringify({ title, url, category: selectedCategory }),
+        body: JSON.stringify({ title: originalTitle, url: originalUrl, category: originalCategory }),
       });
       
       if (!res.ok) {
-        if (res.status === 502 || res.status === 503 || res.status === 504) {
-          throw new Error("waking_up");
-        }
         throw new Error("failed");
       }
       
-      setTitle(""); setUrl("");
-      setIsDialogOpen(false);
-      fetchBookmarks();
-    } catch (err: any) {
-      if (err?.message === "waking_up") {
-        setError("The server is waking up (Render free tier cold start). Please wait a few seconds and try again.");
+      const resData = await res.json();
+      if (resData && resData.data) {
+        setBookmarks(prev => 
+          prev.map(b => b.id === optimisticId ? resData.data : b)
+        );
       } else {
-        setError("Could not connect to the server. If the backend is sleeping, it may take up to a minute to wake up. Please try again shortly.");
+        fetchBookmarks();
       }
-    } finally {
-      setLoading(false);
+    } catch (err) {
+      // Revert optimistic insert on failure
+      setBookmarks(prev => prev.filter(b => b.id !== optimisticId));
+      setError("Failed to connect to the server. Bookmark could not be saved.");
     }
   }
 
   async function updateBookmark() {
     if (!title.trim() || !url.trim()) { setError("Please enter both title and URL."); return; }
     try { new URL(url); } catch { setError("Please enter a valid URL (e.g. https://example.com)."); return; }
+    if (editingId === null) return;
+
+    const targetId = editingId;
+    const originalTitle = title;
+    const originalUrl = url;
+    const originalCategory = selectedCategory;
+
+    const currentBookmark = bookmarks.find(b => b.id === targetId);
+    const urlChanged = currentBookmark ? currentBookmark.url !== originalUrl : true;
+
+    // Close dialog and reset state instantly
+    setIsDialogOpen(false);
+    setEditingId(null);
+    setTitle(""); 
+    setUrl("");
+    setSelectedCategory(null);
     setError("");
-    setLoading(true);
+
+    // Optimistically update list card styling and state
+    setBookmarks(prev => 
+      prev.map(b => b.id === targetId ? {
+        ...b,
+        title: originalTitle,
+        url: originalUrl,
+        category: originalCategory || b.category,
+        status: urlChanged || !originalCategory ? "processing" : b.status,
+        summary: urlChanged || !originalCategory ? "AI is re-analyzing..." : b.summary
+      } : b)
+    );
+
     try {
       const token = await getToken();
-      const res = await fetch(`${API_BASE}/bookmarks/${editingId}`, {
+      const res = await fetch(`${API_BASE}/bookmarks/${targetId}`, {
         method: "PUT",
         headers: { 
           "Content-Type": "application/json",
           "Authorization": `Bearer ${token}`
         },
-        body: JSON.stringify({ title, url, category: selectedCategory }),
+        body: JSON.stringify({ title: originalTitle, url: originalUrl, category: originalCategory }),
       });
       
       if (!res.ok) {
-        if (res.status === 502 || res.status === 503 || res.status === 504) {
-          throw new Error("waking_up");
-        }
         throw new Error("failed");
       }
       
-      setTitle(""); setUrl(""); setEditingId(null);
-      setIsDialogOpen(false);
-      fetchBookmarks();
-    } catch (err: any) {
-      if (err?.message === "waking_up") {
-        setError("The server is waking up (Render free tier cold start). Please wait a few seconds and try again.");
+      const resData = await res.json();
+      if (resData && resData.data) {
+        setBookmarks(prev => 
+          prev.map(b => b.id === targetId ? resData.data : b)
+        );
       } else {
-        setError("Could not connect to the server. If the backend is sleeping, it may take up to a minute to wake up. Please try again shortly.");
+        fetchBookmarks();
       }
-    } finally {
-      setLoading(false);
+    } catch (err) {
+      // Revert optimistic changes on failure
+      fetchBookmarks();
+      setError("Failed to update bookmark. Reverted to previous state.");
     }
   }
 
@@ -260,6 +319,23 @@ export default function Home() {
     }
   }
 
+  async function toggleArchive(bookmarkId: number) {
+    try {
+      const token = await getToken();
+      const res = await fetch(`${API_BASE}/bookmarks/${bookmarkId}/archive`, {
+        method: "PATCH",
+        headers: { "Authorization": `Bearer ${token}` }
+      });
+      if (res.ok) {
+        setBookmarks(prev => prev.filter(b => b.id !== bookmarkId));
+      } else {
+        setError("Failed to archive/unarchive bookmark.");
+      }
+    } catch {
+      setError("An error occurred. Please try again.");
+    }
+  }
+
   function openEdit(bookmark: Bookmark) {
     setTitle(bookmark.title);
     setUrl(bookmark.url);
@@ -277,8 +353,9 @@ export default function Home() {
     setSelectedCategory(null);
   }
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps, react-hooks/set-state-in-effect
-  useEffect(() => { fetchBookmarks(); }, []);
+  useEffect(() => {
+    fetchBookmarks();
+  }, [showArchived, fetchBookmarks]);
 
   // Debounce search — wait 300ms after the user stops typing before hitting the backend
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -290,7 +367,18 @@ export default function Home() {
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [searchQuery]);
+  }, [searchQuery, searchBookmarks]);
+
+  // Poll backend for updates if there are any bookmarks currently in a 'processing' state
+  useEffect(() => {
+    const hasProcessing = bookmarks.some(b => b.status === "processing");
+    if (hasProcessing) {
+      const timer = setTimeout(() => {
+        fetchBookmarks();
+      }, 1500); // Poll every 1.5s for faster responsive updates
+      return () => clearTimeout(timer);
+    }
+  }, [bookmarks, fetchBookmarks]);
 
   // Close dialog on ESC key
   useEffect(() => {
@@ -303,7 +391,7 @@ export default function Home() {
   const categories = ["All", ...Array.from(new Set(safeBookmarks.map(b => b.category).filter(Boolean)))];
 
   const visible = safeBookmarks.filter(b =>
-    (activeCategory === "All" || b.category === activeCategory)
+    (activeCategory === "All" || b.category === activeCategory || b.status === "processing")
   );
 
   // ─── Styles ────────────────────────────────────────────────────────────────
@@ -347,7 +435,7 @@ export default function Home() {
 
   const dialogStyle: React.CSSProperties = {
     background: "#111118", border: "1px solid rgba(139,92,246,0.25)",
-    borderRadius: "20px", padding: isMobile ? "20px" : "32px", width: "90%", maxWidth: "460px",
+    borderRadius: "20px", padding: isMounted ? (isMobile ? "20px" : "32px") : "32px", width: "90%", maxWidth: "460px",
     boxShadow: "0 24px 64px rgba(0,0,0,0.5), 0 0 0 1px rgba(139,92,246,0.08)",
     animation: "dialogSlideIn 0.25s ease",
   };
@@ -388,7 +476,7 @@ export default function Home() {
         <div style={{ display: "flex", minHeight: "100vh", background: "var(--bg)" }}>
 
           {/* Mobile sidebar overlay back-drop */}
-          {isMobile && isSidebarOpen && (
+          {showMobileUI && isSidebarOpen && (
             <div 
               onClick={() => setIsSidebarOpen(false)}
               style={{
@@ -404,7 +492,7 @@ export default function Home() {
             background: "var(--sidebar-bg)", borderRight: "1px solid var(--border)",
             display: "flex", flexDirection: "column",
             position: "fixed", top: 0, 
-            left: isMobile ? (isSidebarOpen ? 0 : "-260px") : 0, 
+            left: isMounted ? (isMobile ? (isSidebarOpen ? 0 : "-260px") : 0) : 0, 
             bottom: 0, zIndex: 100,
             transition: "left 0.25s cubic-bezier(0.4, 0, 0.2, 1)",
           }}>
@@ -457,8 +545,26 @@ export default function Home() {
 
         {/* Categories */}
         <div style={{ padding: "0 12px", flex: 1, overflowY: "auto" }}>
-          <div style={{ fontSize: "10px", fontWeight: 700, color: "var(--text-muted)", letterSpacing: "0.1em", textTransform: "uppercase", padding: "0 8px 10px" }}>
-            Categories
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "0 8px 10px" }}>
+            <span style={{ fontSize: "10px", fontWeight: 700, color: "var(--text-muted)", letterSpacing: "0.1em", textTransform: "uppercase" }}>
+              Categories
+            </span>
+            <button
+              onClick={() => setShowArchived(prev => !prev)}
+              style={{
+                background: showArchived ? "rgba(139,92,246,0.15)" : "rgba(255,255,255,0.05)",
+                border: showArchived ? "1px solid rgba(139,92,246,0.3)" : "1px solid var(--border)",
+                borderRadius: "6px",
+                color: showArchived ? "#a78bfa" : "var(--text-muted)",
+                fontSize: "10px",
+                fontWeight: 600,
+                padding: "2px 8px",
+                cursor: "pointer",
+                transition: "all 0.15s",
+              }}
+            >
+              {showArchived ? "Showing Archived" : "View Archive"}
+            </button>
           </div>
           {categories.map(cat => (
             <button
@@ -512,13 +618,13 @@ export default function Home() {
         onTouchMove={handleTouchMove}
         onTouchEnd={handleTouchEnd}
         style={{ 
-          marginLeft: isMobile ? 0 : "260px", 
+          marginLeft: isMounted ? (isMobile ? 0 : "260px") : "260px", 
           flex: 1, 
           display: "flex", 
           flexDirection: "column", 
           minHeight: "100vh",
           position: "relative",
-          width: isMobile ? "100%" : "calc(100% - 260px)"
+          width: isMounted ? (isMobile ? "100%" : "calc(100% - 260px)") : "calc(100% - 260px)"
         }}
       >
         {/* Swipe-to-refresh premium visual spinner */}
@@ -564,10 +670,10 @@ export default function Home() {
           position: "sticky", top: 0, zIndex: 9,
           background: "rgba(7,7,10,0.85)", backdropFilter: "blur(14px)",
           borderBottom: "1px solid var(--border)",
-          padding: isMobile ? "10px 16px" : "14px 32px", 
+          padding: isMounted ? (isMobile ? "10px 16px" : "14px 32px") : "14px 32px", 
           display: "flex", alignItems: "center", gap: "10px",
         }}>
-          {isMobile && (
+          {showMobileUI && (
             <button 
               onClick={() => setIsSidebarOpen(true)}
               style={{
@@ -603,7 +709,7 @@ export default function Home() {
         </div>
 
         {/* Page content */}
-        <div style={{ padding: isMobile ? "16px" : "32px", flex: 1 }}>
+        <div style={{ padding: isMounted ? (isMobile ? "16px" : "32px") : "32px", flex: 1 }}>
 
           {/* Heading */}
           <div style={{ marginBottom: "24px" }}>
@@ -641,7 +747,7 @@ export default function Home() {
           {/* Bookmark grid */}
           <div style={{ 
             display: "grid", 
-            gridTemplateColumns: isMobile ? "1fr" : "repeat(auto-fill, minmax(340px, 1fr))", 
+            gridTemplateColumns: isMounted ? (isMobile ? "1fr" : "repeat(auto-fill, minmax(340px, 1fr))") : "repeat(auto-fill, minmax(340px, 1fr))", 
             gap: "16px" 
           }}>
             {visible.map((bookmark, index) => (
@@ -650,7 +756,7 @@ export default function Home() {
                 style={{
                   background: "rgba(255,255,255,0.025)", border: "1px solid var(--border)",
                   borderRadius: "16px", padding: "20px",
-                  transition: "transform 0.2s, border-color 0.2s, box-shadow 0.2s",
+                  transition: "transform 0.2s, border-color 0.3s ease, box-shadow 0.2s, background-color 0.3s ease",
                   animation: "fadeInUp 0.4s ease both",
                   animationDelay: `${index * 0.05}s`,
                 }}
@@ -669,22 +775,55 @@ export default function Home() {
               >
                 {/* Card header row */}
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "12px" }}>
-                  <span style={{
-                    fontSize: "11px", fontWeight: 600, padding: "3px 10px", borderRadius: "20px",
-                    background: `${getCategoryColor(bookmark.category)}1a`,
-                    color: getCategoryColor(bookmark.category),
-                    border: `1px solid ${getCategoryColor(bookmark.category)}33`,
-                    letterSpacing: "0.03em",
-                  }}>
-                    {bookmark.category || "Uncategorized"}
-                  </span>
+                  <div style={{ display: "flex", alignItems: "center" }}>
+                    <span style={{
+                      fontSize: "11px", fontWeight: 600, padding: "3px 10px", borderRadius: "20px",
+                      background: bookmark.status === "processing" ? "rgba(255, 255, 255, 0.05)" : `${getCategoryColor(bookmark.category)}1a`,
+                      color: bookmark.status === "processing" ? "var(--text-muted)" : getCategoryColor(bookmark.category),
+                      border: `1px solid ${bookmark.status === "processing" ? "var(--border)" : `${getCategoryColor(bookmark.category)}33`}`,
+                      letterSpacing: "0.03em",
+                      transition: "background-color 0.3s ease, color 0.3s ease, border-color 0.3s ease",
+                    }}>
+                      {bookmark.status === "processing" ? "Analyzing..." : (bookmark.category || "Uncategorized")}
+                    </span>
+                    {bookmark.is_archived && (
+                      <span style={{
+                        fontSize: "9px", fontWeight: 700, padding: "2px 6px", borderRadius: "4px",
+                        background: "rgba(239, 68, 68, 0.15)", color: "#ef4444", marginLeft: "6px"
+                      }}>
+                        ARCHIVED
+                      </span>
+                    )}
+                  </div>
                   <div style={{ display: "flex", gap: "6px" }}>
                     <button
-                      onClick={() => openEdit(bookmark)}
-                      title="Edit"
+                      onClick={() => toggleArchive(bookmark.id)}
+                      title={showArchived ? "Unarchive" : "Archive"}
                       style={iconBtn}
-                      onMouseEnter={e => { const b = e.currentTarget as HTMLButtonElement; b.style.background = "var(--surface-hover)"; b.style.color = "var(--accent)"; }}
-                      onMouseLeave={e => { const b = e.currentTarget as HTMLButtonElement; b.style.background = "var(--surface)"; b.style.color = "var(--text-muted)"; }}
+                      onMouseEnter={e => { const b = e.currentTarget as HTMLButtonElement; b.style.background = "rgba(139,92,246,0.1)"; b.style.color = "#8b5cf6"; b.style.borderColor = "rgba(139,92,246,0.3)"; }}
+                      onMouseLeave={e => { const b = e.currentTarget as HTMLButtonElement; b.style.background = "var(--surface)"; b.style.color = "var(--text-muted)"; b.style.borderColor = "var(--border)"; }}
+                    >
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                        <polyline points="21 8 21 21 3 21 3 8" />
+                        <rect x="1" y="3" width="22" height="5" />
+                        <line x1="10" y1="12" x2="14" y2="12" />
+                      </svg>
+                    </button>
+                    <button
+                      onClick={() => { if (bookmark.status !== "processing") openEdit(bookmark); }}
+                      disabled={bookmark.status === "processing"}
+                      title={bookmark.status === "processing" ? "AI is analyzing this bookmark" : "Edit"}
+                      style={{ ...iconBtn, opacity: bookmark.status === "processing" ? 0.4 : 1, cursor: bookmark.status === "processing" ? "not-allowed" : "pointer" }}
+                      onMouseEnter={e => {
+                        if (bookmark.status !== "processing") {
+                          const b = e.currentTarget as HTMLButtonElement; b.style.background = "var(--surface-hover)"; b.style.color = "var(--accent)";
+                        }
+                      }}
+                      onMouseLeave={e => {
+                        if (bookmark.status !== "processing") {
+                          const b = e.currentTarget as HTMLButtonElement; b.style.background = "var(--surface)"; b.style.color = "var(--text-muted)";
+                        }
+                      }}
                     >
                       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                         <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
@@ -709,7 +848,7 @@ export default function Home() {
 
                 {/* Title */}
                 <h3 style={{ fontSize: "15px", fontWeight: 700, color: "var(--text)", marginBottom: "8px", letterSpacing: "-0.2px", lineHeight: 1.4 }}>
-                  {bookmark.title}
+                  {bookmark.title || "Analyzing Title..."}
                 </h3>
 
                 {/* URL + date row */}
@@ -741,10 +880,33 @@ export default function Home() {
 
                 {/* AI Summary */}
                 <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: "10px", padding: "12px" }}>
-                  <div style={{ fontSize: "10px", fontWeight: 700, color: "var(--accent)", marginBottom: "6px", letterSpacing: "0.08em" }}>
-                    ✦ AI SUMMARY
+                  <div style={{
+                    fontSize: "10px",
+                    fontWeight: 700,
+                    color: bookmark.status === "processing" ? "var(--text-muted)" : "var(--accent)",
+                    marginBottom: "6px",
+                    letterSpacing: "0.08em",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "6px",
+                  }}>
+                    {bookmark.status === "processing" && (
+                      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"
+                        style={{ animation: "spin 1s linear infinite" }}
+                      >
+                        <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+                      </svg>
+                    )}
+                    {bookmark.status === "processing" ? "✦ AI ANALYZING..." : "✦ AI SUMMARY"}
                   </div>
-                  <p style={{ fontSize: "12.5px", color: "var(--text-secondary)", lineHeight: 1.65, margin: 0 }}>
+                  <p style={{
+                    fontSize: "12.5px",
+                    color: bookmark.status === "processing" ? "var(--text-muted)" : "var(--text-secondary)",
+                    lineHeight: 1.65,
+                    margin: 0,
+                    animation: bookmark.status === "processing" ? "pulse 1.5s infinite ease-in-out" : "none",
+                    transition: "color 0.3s ease",
+                  }}>
                     {bookmark.summary}
                   </p>
                 </div>
@@ -784,7 +946,15 @@ export default function Home() {
                 placeholder="e.g. OpenAI Documentation"
                 value={title}
                 onChange={e => setTitle(e.target.value)}
-                onKeyDown={e => { if (e.key === "Enter") editingId ? updateBookmark() : addBookmark(); }}
+                onKeyDown={e => {
+                  if (e.key === "Enter") {
+                    if (editingId) {
+                      updateBookmark();
+                    } else {
+                      addBookmark();
+                    }
+                  }
+                }}
                 autoFocus
                 style={inputStyle}
                 onFocus={e => e.target.style.borderColor = "var(--accent)"}
@@ -799,7 +969,15 @@ export default function Home() {
                 placeholder="https://..."
                 value={url}
                 onChange={e => setUrl(e.target.value)}
-                onKeyDown={e => { if (e.key === "Enter") editingId ? updateBookmark() : addBookmark(); }}
+                onKeyDown={e => {
+                  if (e.key === "Enter") {
+                    if (editingId) {
+                      updateBookmark();
+                    } else {
+                      addBookmark();
+                    }
+                  }
+                }}
                 style={inputStyle}
                 onFocus={e => e.target.style.borderColor = "var(--accent)"}
                 onBlur={e => e.target.style.borderColor = "var(--border)"}
