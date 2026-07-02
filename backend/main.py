@@ -780,7 +780,7 @@ async def import_bookmarks_html(
     # 3. Async Background Task Scheduling
     if background_tasks:
         for b in bookmarks_to_create:
-            background_tasks.add_task(enrich_bookmark_task, b.id, db)
+            background_tasks.add_task(enrich_bookmark_task, b.id)
 
     return {
         "message": f"Successfully imported {imported_count} bookmarks. Skipped {skipped_count} duplicates/invalid links.",
