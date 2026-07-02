@@ -184,7 +184,13 @@ class BookmarkSchema(BaseModel):
         v = v.strip()
         if not v:
             raise ValueError("URL cannot be empty")
-        if not v.startswith(("http://", "https://")):
+        
+        # Validate that explicit protocols are strictly http or https
+        if "://" in v:
+            scheme = v.split("://", 1)[0].lower()
+            if scheme not in ["http", "https"]:
+                raise ValueError("Invalid URL scheme. Must be http or https.")
+        else:
             v = "https://" + v
         
         parsed = urlparse(v)
