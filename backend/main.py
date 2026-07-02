@@ -99,6 +99,22 @@ def run_migrations():
     except Exception as e:
         print("Failed to run HNSW vector index migration:", e)
 
+    # E. Check and add tags column
+    has_tags = True
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT tags FROM bookmarks LIMIT 1"))
+    except Exception:
+        has_tags = False
+
+    if not has_tags:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE bookmarks ADD COLUMN tags JSON"))
+            print("Database migration: tags column successfully added.")
+        except Exception as e:
+            print("Failed to run tags column migration:", e)
+
 run_migrations()
 
 ENVIRONMENT = (os.getenv("ENVIRONMENT", "") or os.getenv("ENV", "")).lower()
@@ -177,6 +193,16 @@ class BookmarkSchema(BaseModel):
     title: str
     url: str
     category: str | None = None  # Optional override; None = let AI decide
+    tags: List[str] = []
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def sanitize_tags(cls, v):
+        if not v:
+            return []
+        if isinstance(v, list):
+            return list(set(str(t).strip().lower() for t in v if str(t).strip()))
+        return []
 
     @field_validator("url", mode="before")
     @classmethod
@@ -204,6 +230,7 @@ class BookmarkSchema(BaseModel):
 class BookmarkAI(BaseModel):
     summary: str
     category: str
+    tags: List[str]
 
 
 class BookmarkResponse(BaseModel):
@@ -216,6 +243,22 @@ class BookmarkResponse(BaseModel):
     status: str
     is_archived: bool = False
     created_at: datetime
+    tags: List[str] = []
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def normalize_tags(cls, v):
+        if v is None:
+            return []
+        if isinstance(v, str):
+            try:
+                import json
+                return json.loads(v)
+            except Exception:
+                return []
+        if isinstance(v, list):
+            return [str(item) for item in v]
+        return []
 
     class Config:
         from_attributes = True
@@ -248,7 +291,7 @@ VALID_CATEGORIES = [
     "Mobile", "Security", "Cloud", "Productivity", "Programming", "Other",
 ]
 
-async def generate_summary(title: str, url: str, scraped_text: str | None = None) -> dict:
+async def generate_summary(title: str, url: str, scraped_text: str | None = None, existing_categories: List[str] = None) -> dict:
     prompt = f"""
     You are generating metadata for a bookmark manager application.
     Analyze the bookmark below and return a JSON object.
@@ -262,10 +305,15 @@ async def generate_summary(title: str, url: str, scraped_text: str | None = None
     else:
         prompt += "\nInstructions: Scraped text was unavailable. Describe what this resource is about based on the Title and URL."
 
+    categories_ctx = ""
+    if existing_categories:
+        categories_ctx = f" Here is a list of the user's existing broad categories: {existing_categories}. Reuse one of these if it matches well, otherwise generate a new broad capitalized category name if none of them apply."
+
     prompt += f"""
     Return a JSON object containing:
     - summary: A concise 2-3 sentence description of what this resource is about.
-    - category: Exactly one value from this list: {", ".join(VALID_CATEGORIES)}
+    - category: A VERY broad capitalized category name (e.g., 'Tech', 'Cooking', 'Finance', 'Design', 'Lifestyle', 'News', 'Education', 'Other'). Do not use specific technical subcategories like 'Frontend', 'Backend', 'AI/ML', 'DevOps', 'Mobile', 'Security', or 'Programming' as categories; classify them all under 'Tech' instead.{categories_ctx}
+    - tags: An array of 3-5 specific subcategory keyword tags (lowercase, alphanumeric, no spaces, e.g. "nextjs", "react", "baking", "desserts", "programming", "mobile", "security").
     """
     max_retries = 3
     delay = 1.0
@@ -281,8 +329,18 @@ async def generate_summary(title: str, url: str, scraped_text: str | None = None
                 ),
             )
             data = json.loads(response.text)
-            if data.get("category") not in VALID_CATEGORIES:
+            if "category" in data and isinstance(data["category"], str):
+                data["category"] = data["category"].strip()
+                if data["category"] == "":
+                    data["category"] = "Other"
+            else:
                 data["category"] = "Other"
+            
+            if "tags" in data and isinstance(data["tags"], list):
+                data["tags"] = list(set(str(t).strip().lower() for t in data["tags"] if str(t).strip()))
+            else:
+                data["tags"] = []
+                
             return data
         except Exception as e:
             error_str = str(e)
@@ -297,7 +355,7 @@ async def generate_summary(title: str, url: str, scraped_text: str | None = None
 
 # ── Background Worker Task ───────────────────────────────────────────────────
 
-async def enrich_bookmark_task(bookmark_id: int, user_category: str | None = None):
+async def enrich_bookmark_task(bookmark_id: int, user_category: str | None = None, user_tags: List[str] | None = None):
     """
     Background worker task to scrape a webpage and generate AI metadata.
     Uses an isolated database session context.
@@ -307,6 +365,17 @@ async def enrich_bookmark_task(bookmark_id: int, user_category: str | None = Non
         bookmark = db.query(Bookmark).filter(Bookmark.id == bookmark_id).first()
         if not bookmark:
             return
+
+        existing_categories = []
+        try:
+            existing_categories = [
+                r[0] for r in db.query(Bookmark.category)
+                .filter(Bookmark.user_id == bookmark.user_id)
+                .distinct().all()
+                if r[0]
+            ]
+        except Exception as e:
+            logger.warning(f"Failed to fetch existing categories for user {bookmark.user_id}: {e}")
 
         # 1. Web scraping
         scraped = await scrape_url(bookmark.url)
@@ -318,18 +387,21 @@ async def enrich_bookmark_task(bookmark_id: int, user_category: str | None = Non
 
         # 2. Call Gemini
         scraped_text = scraped.get("text") or scraped.get("description")
-        ai = await generate_summary(title_to_use, bookmark.url, scraped_text)
+        ai = await generate_summary(title_to_use, bookmark.url, scraped_text, existing_categories)
 
-        # 3. Save summary and category
+        # 3. Save summary, category, and tags
         bookmark.summary = ai["summary"]
         bookmark.category = user_category or ai["category"]
+        bookmark.tags = user_tags if user_tags is not None else ai["tags"]
 
         # 4. Generate Vector Embedding with Rich Content Representation (Resilient to failure)
         scraped_text_snippet = f"\nContent: {scraped_text[:1500]}" if scraped_text else ""
+        tags_str = f"\nTags: {', '.join(bookmark.tags)}" if bookmark.tags else ""
         text_to_embed = (
             f"Title: {title_to_use}\n"
             f"Category: {bookmark.category}\n"
             f"Summary: {bookmark.summary}"
+            f"{tags_str}"
             f"{scraped_text_snippet}"
         )
         try:
@@ -341,14 +413,14 @@ async def enrich_bookmark_task(bookmark_id: int, user_category: str | None = Non
             if embed_resp and embed_resp.embeddings:
                 bookmark.embedding = embed_resp.embeddings[0].values
         except Exception as embed_err:
-            print(f"Failed to generate embedding for bookmark {bookmark_id}: {embed_err}")
+            logger.error(f"Failed to generate embedding for bookmark {bookmark_id}: {embed_err}")
 
         # 5. Complete task
         bookmark.status = "completed"
         db.commit()
     except Exception as e:
         db.rollback()
-        print(f"Error in background task for bookmark {bookmark_id}: {e}")
+        logger.error(f"Error in background task for bookmark {bookmark_id}: {e}")
         try:
             bookmark = db.query(Bookmark).filter(Bookmark.id == bookmark_id).first()
             if bookmark:
@@ -356,6 +428,8 @@ async def enrich_bookmark_task(bookmark_id: int, user_category: str | None = Non
                 bookmark.summary = "AI summarization failed."
                 if not bookmark.category:
                     bookmark.category = user_category or "Other"
+                if bookmark.tags is None:
+                    bookmark.tags = user_tags or []
                 db.commit()
         except Exception:
             pass
@@ -388,10 +462,40 @@ def get_bookmarks(
 
 @app.get("/search", response_model=List[BookmarkResponse], dependencies=[Depends(search_limiter)])
 async def search_bookmarks(q: str, db: Session = Depends(get_db), user_id: str = Depends(get_current_user)):
+    from sqlalchemy import cast, String
     clean_q = q.strip()[:500]
     if not clean_q:
         return []
 
+    # 1. Fetch Keyword Results (Exact/lexical matching is highly precise)
+    terms = [t for t in clean_q.split() if len(t) > 1]
+    if not terms:
+        terms = [clean_q]
+        
+    conditions = []
+    for term in terms:
+        conditions.append(
+            or_(
+                Bookmark.title.ilike(f"%{term}%"),
+                Bookmark.url.ilike(f"%{term}%"),
+                Bookmark.summary.ilike(f"%{term}%"),
+                Bookmark.category.ilike(f"%{term}%"),
+                cast(Bookmark.tags, String).ilike(f"%{term}%")
+            )
+        )
+
+    try:
+        keyword_results = (
+            db.query(Bookmark)
+            .filter(Bookmark.user_id == user_id, *conditions)
+            .limit(20)
+            .all()
+        )
+    except Exception as e:
+        logger.error(f"Failed to execute keyword search: {e}", exc_info=True)
+        keyword_results = []
+
+    # 2. Fetch Vector Results (Semantic conceptual recommendations)
     query_vector = None
     try:
         embed_resp = await client.aio.models.embed_content(
@@ -402,9 +506,8 @@ async def search_bookmarks(q: str, db: Session = Depends(get_db), user_id: str =
         if embed_resp and embed_resp.embeddings:
             query_vector = embed_resp.embeddings[0].values
     except Exception as e:
-        print("Failed to embed search query:", e)
+        logger.error(f"Failed to embed search query: {e}")
 
-    # 1. Fetch Vector Results (with distance threshold)
     vector_results = []
     if query_vector:
         try:
@@ -413,46 +516,23 @@ async def search_bookmarks(q: str, db: Session = Depends(get_db), user_id: str =
                 .filter(
                     Bookmark.user_id == user_id, 
                     Bookmark.embedding.is_not(None),
-                    Bookmark.embedding.cosine_distance(query_vector) < 0.65
+                    Bookmark.embedding.cosine_distance(query_vector) < 0.45
                 )
                 .order_by(Bookmark.embedding.cosine_distance(query_vector))
                 .limit(20)
                 .all()
             )
         except Exception as e:
-            print("Failed to execute vector search:", e)
+            logger.error(f"Failed to execute vector search: {e}")
 
-    # 2. Fetch Keyword Results (Multi-Term word order resilient)
-    terms = [t for t in clean_q.split() if len(t) > 1]
-    if not terms:
-        terms = [clean_q] # Fallback to full query if short
-        
-    conditions = []
-    for term in terms:
-        conditions.append(
-            or_(
-                Bookmark.title.ilike(f"%{term}%"),
-                Bookmark.url.ilike(f"%{term}%"),
-                Bookmark.summary.ilike(f"%{term}%"),
-                Bookmark.category.ilike(f"%{term}%"),
-            )
-        )
-
-    keyword_results = (
-        db.query(Bookmark)
-        .filter(Bookmark.user_id == user_id, *conditions)
-        .limit(20)
-        .all()
-    )
-
-    # 3. Direct merge and deduplicate
+    # 3. Direct merge: Lexical matches first, then unique semantic recommendations
     seen = set()
     combined = []
-    for b in vector_results:
+    for b in keyword_results:
         if b.id not in seen:
             seen.add(b.id)
             combined.append(b)
-    for b in keyword_results:
+    for b in vector_results:
         if b.id not in seen:
             seen.add(b.id)
             combined.append(b)
@@ -467,14 +547,15 @@ def create_bookmark(
     db: Session = Depends(get_db),
     user_id: str = Depends(get_current_user)
 ):
-    user_category = bookmark.category if bookmark.category in VALID_CATEGORIES else None
+    user_category = bookmark.category.strip() if bookmark.category and bookmark.category.strip() else None
     new_bookmark = Bookmark(
         title=bookmark.title,
         url=bookmark.url,
         summary="AI is analyzing...",
         category=user_category or "Other",
         user_id=user_id,
-        status="processing"
+        status="processing",
+        tags=bookmark.tags
     )
     db.add(new_bookmark)
     try:
@@ -485,7 +566,7 @@ def create_bookmark(
         logger.error(f"Database transaction failure in create_bookmark: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Database transaction failed.")
 
-    background_tasks.add_task(enrich_bookmark_task, new_bookmark.id, user_category)
+    background_tasks.add_task(enrich_bookmark_task, new_bookmark.id, user_category, bookmark.tags)
     return {"message": "Bookmark added", "data": new_bookmark}
 
 
@@ -516,7 +597,7 @@ def update_bookmark(
     if not bookmark:
         raise HTTPException(status_code=404, detail="Bookmark not found")
 
-    user_category = updated.category if updated.category in VALID_CATEGORIES else None
+    user_category = updated.category.strip() if updated.category and updated.category.strip() else None
     
     # Check if we should re-scrape and re-summarize
     needs_enrichment = (
@@ -529,6 +610,7 @@ def update_bookmark(
 
     bookmark.title = updated.title
     bookmark.url = updated.url
+    bookmark.tags = updated.tags
 
     if needs_enrichment:
         bookmark.status = "processing"
@@ -541,12 +623,10 @@ def update_bookmark(
             logger.error(f"Database transaction failure in update_bookmark (enrichment path): {e}", exc_info=True)
             raise HTTPException(status_code=500, detail="Database transaction failed.")
             
-        background_tasks.add_task(enrich_bookmark_task, bookmark.id, user_category)
+        background_tasks.add_task(enrich_bookmark_task, bookmark.id, user_category, updated.tags)
     else:
-        # URL is unchanged and bookmark has summary - update metadata synchronously
         if user_category:
             bookmark.category = user_category
-        # Keep existing auto category if user_category is None
         try:
             db.commit()
             db.refresh(bookmark)

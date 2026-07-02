@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useState, useRef, useCallback } from "react";
-import { Show, SignInButton, UserButton, useAuth } from "@clerk/nextjs";
+import { useEffect, useState, useRef, useCallback, useMemo } from "react";
+import { Show, SignInButton, UserButton, useAuth, useUser } from "@clerk/nextjs";
 
 type Bookmark = {
   id: number;
@@ -12,6 +12,7 @@ type Bookmark = {
   created_at: string;
   status?: string;
   is_archived?: boolean;
+  tags?: string[];
 };
 
 type ChatMessage = {
@@ -141,7 +142,16 @@ const CATEGORY_COLORS: Record<string, string> = {
 };
 
 function getCategoryColor(cat: string) {
-  return CATEGORY_COLORS[cat] || "#6b7280";
+  if (!cat) return "#6b7280";
+  if (CATEGORY_COLORS[cat]) return CATEGORY_COLORS[cat];
+  
+  // Generate deterministic HSL color based on string hash
+  let hash = 0;
+  for (let i = 0; i < cat.length; i++) {
+    hash = cat.charCodeAt(i) + ((hash << 5) - hash);
+  }
+  const hue = Math.abs(hash % 360);
+  return `hsl(${hue}, 75%, 65%)`;
 }
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
@@ -160,6 +170,12 @@ export default function Home() {
   // null = "Auto (AI)" — let backend Gemini decide
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [showArchived, setShowArchived] = useState(false);
+  const [selectedTag, setSelectedTag] = useState<string | null>(null);
+  const [customCategory, setCustomCategory] = useState("");
+  const [dialogTags, setDialogTags] = useState("");
+  const [currentTourStep, setCurrentTourStep] = useState<number | null>(null);
+  const [isBookmarksLoading, setIsBookmarksLoading] = useState(true);
+  const { user, isLoaded } = useUser();
 
   // RAG Chat States
   const [isChatOpen, setIsChatOpen] = useState(false);
@@ -191,6 +207,18 @@ export default function Home() {
       window.removeEventListener("resize", checkRes);
     };
   }, []);
+
+  const hasAttemptedInit = useRef(false);
+
+  // Trigger guided tour automatically for new or existing users once authenticated
+  useEffect(() => {
+    if (isMounted && isLoaded && user && !hasAttemptedInit.current) {
+      hasAttemptedInit.current = true;
+      if (user.unsafeMetadata?.hasCompletedTour !== true) {
+        setCurrentTourStep(0);
+      }
+    }
+  }, [isMounted, isLoaded, user]);
 
   const showMobileUI = isMounted && isMobile;
   
@@ -242,6 +270,7 @@ export default function Home() {
 
   const fetchBookmarks = useCallback(async (archivedOverride?: boolean) => {
     try {
+      setIsBookmarksLoading(true);
       const targetArchived = archivedOverride !== undefined ? archivedOverride : showArchived;
       const token = await getToken();
       if (!token) return;
@@ -256,12 +285,15 @@ export default function Home() {
       }
     } catch {
       setBookmarks([]);
+    } finally {
+      setIsBookmarksLoading(false);
     }
   }, [getToken, showArchived]);
 
   const searchBookmarks = useCallback(async (query: string) => {
     if (!query.trim()) { fetchBookmarks(); return; }
     try {
+      setIsBookmarksLoading(true);
       const token = await getToken();
       if (!token) return;
       const res = await fetch(`${API_BASE}/search?q=${query}`, {
@@ -275,6 +307,8 @@ export default function Home() {
       }
     } catch {
       setBookmarks([]);
+    } finally {
+      setIsBookmarksLoading(false);
     }
   }, [getToken, fetchBookmarks]);
 
@@ -290,7 +324,13 @@ export default function Home() {
     
     const originalTitle = title;
     const originalUrl = normalizedUrl;
-    const originalCategory = selectedCategory;
+    
+    // Resolve dynamic category
+    const finalCategory = selectedCategory === "custom" ? customCategory.trim() : (selectedCategory || null);
+    
+    // Resolve tags
+    const tagsArray = dialogTags.split(",").map(t => t.trim().toLowerCase()).filter(Boolean);
+    
     const optimisticId = -Date.now();
 
     const optimisticBookmark: Bookmark = {
@@ -298,9 +338,10 @@ export default function Home() {
       title: originalTitle || "New Bookmark",
       url: originalUrl,
       summary: "AI is analyzing...",
-      category: originalCategory || "Other",
+      category: finalCategory || "Other",
       created_at: new Date().toISOString(),
-      status: "processing"
+      status: "processing",
+      tags: tagsArray
     };
 
     // Close dialog and clear inputs instantly
@@ -308,6 +349,8 @@ export default function Home() {
     setTitle(""); 
     setUrl("");
     setSelectedCategory(null);
+    setDialogTags("");
+    setCustomCategory("");
     setError("");
 
     // Optimistically prepend to list
@@ -321,7 +364,12 @@ export default function Home() {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${token}` 
         },
-        body: JSON.stringify({ title: originalTitle, url: originalUrl, category: originalCategory }),
+        body: JSON.stringify({ 
+          title: originalTitle, 
+          url: originalUrl, 
+          category: finalCategory,
+          tags: tagsArray
+        }),
       });
       
       if (!res.ok) {
@@ -337,7 +385,6 @@ export default function Home() {
         fetchBookmarks();
       }
     } catch (err) {
-      // Revert optimistic insert on failure
       setBookmarks(prev => prev.filter(b => b.id !== optimisticId));
       setError("Failed to connect to the server. Bookmark could not be saved.");
     }
@@ -358,7 +405,12 @@ export default function Home() {
     const targetId = editingId;
     const originalTitle = title;
     const originalUrl = normalizedUrl;
-    const originalCategory = selectedCategory;
+    
+    // Resolve dynamic category
+    const finalCategory = selectedCategory === "custom" ? customCategory.trim() : (selectedCategory || null);
+    
+    // Resolve tags
+    const tagsArray = dialogTags.split(",").map(t => t.trim().toLowerCase()).filter(Boolean);
 
     const currentBookmark = bookmarks.find(b => b.id === targetId);
     const urlChanged = currentBookmark ? currentBookmark.url !== originalUrl : true;
@@ -369,6 +421,8 @@ export default function Home() {
     setTitle(""); 
     setUrl("");
     setSelectedCategory(null);
+    setDialogTags("");
+    setCustomCategory("");
     setError("");
 
     // Optimistically update list card styling and state
@@ -377,9 +431,10 @@ export default function Home() {
         ...b,
         title: originalTitle,
         url: originalUrl,
-        category: originalCategory || b.category,
-        status: urlChanged || !originalCategory ? "processing" : b.status,
-        summary: urlChanged || !originalCategory ? "AI is re-analyzing..." : b.summary
+        category: finalCategory || b.category,
+        tags: tagsArray,
+        status: urlChanged || !finalCategory ? "processing" : b.status,
+        summary: urlChanged || !finalCategory ? "AI is re-analyzing..." : b.summary
       } : b)
     );
 
@@ -391,7 +446,12 @@ export default function Home() {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${token}`
         },
-        body: JSON.stringify({ title: originalTitle, url: originalUrl, category: originalCategory }),
+        body: JSON.stringify({ 
+          title: originalTitle, 
+          url: originalUrl, 
+          category: finalCategory,
+          tags: tagsArray
+        }),
       });
       
       if (!res.ok) {
@@ -407,7 +467,6 @@ export default function Home() {
         fetchBookmarks();
       }
     } catch (err) {
-      // Revert optimistic changes on failure
       fetchBookmarks();
       setError("Failed to update bookmark. Reverted to previous state.");
     }
@@ -543,8 +602,9 @@ export default function Home() {
     setTitle(bookmark.title);
     setUrl(bookmark.url);
     setEditingId(bookmark.id);
-    // Pre-select the current category so the user can see and optionally change it
     setSelectedCategory(bookmark.category || null);
+    setDialogTags(bookmark.tags ? bookmark.tags.join(", ") : "");
+    setCustomCategory("");
     setError("");
     setIsDialogOpen(true);
   }
@@ -554,6 +614,8 @@ export default function Home() {
     setEditingId(null);
     setTitle(""); setUrl(""); setError("");
     setSelectedCategory(null);
+    setDialogTags("");
+    setCustomCategory("");
   }
 
   useEffect(() => {
@@ -589,13 +651,189 @@ export default function Home() {
     if (isDialogOpen) { window.addEventListener("keydown", onKey); return () => window.removeEventListener("keydown", onKey); }
   }, [isDialogOpen]);
 
+  const tourSteps = [
+    {
+      targetId: "", // Step 0: Welcome modal
+      title: "Welcome to AI Bookmark Vault! ✦",
+      description: "Let's take a quick 1-minute tour to see how to organize your links, save bookmarks instantly, and search them conceptually with AI."
+    },
+    {
+      targetId: "bookmarklet-badge",
+      title: "One-Click Bookmarklet 🚀",
+      description: "Drag this purple badge directly up to your browser's bookmarks bar. Clicking it on any webpage will instantly save it to your vault!"
+    },
+    {
+      targetId: "chat-btn",
+      title: "Conversational AI Assistant 💬",
+      description: "Click this assistant button to open a chat drawer. Ask questions, request summaries, or query all your saved links conceptually using Gemini!"
+    },
+    {
+      targetId: "import-btn",
+      title: "HTML Bookmarks Bulk Import 📁",
+      description: "Already have bookmarks? Click here to upload a standard Netscape HTML bookmarks file exported from Chrome or Safari."
+    },
+    {
+      targetId: "add-btn",
+      title: "Manual Bookmark Entry ➕",
+      description: "Click here to add link overrides manually, define custom broad categories, or input specific tags."
+    }
+  ];
+
+  const [highlightStyle, setHighlightStyle] = useState<React.CSSProperties>({});
+  const [tooltipStyle, setTooltipStyle] = useState<React.CSSProperties>({
+    position: "fixed",
+    left: "50%",
+    top: "50%",
+    transform: "translate(-50%, -50%)",
+    zIndex: 100002,
+    width: "360px"
+  });
+
+  useEffect(() => {
+    if (currentTourStep === null || currentTourStep === undefined) return;
+    const step = tourSteps[currentTourStep];
+    
+    // Automatically manage sidebar open state based on the targeted element
+    const isSidebarTarget = ["bookmarklet-badge", "import-btn", "chat-btn", "add-btn"].includes(step.targetId);
+    if (isSidebarTarget) {
+      setIsSidebarOpen(true);
+    } else if (isMobile) {
+      setIsSidebarOpen(false);
+    }
+    
+    // Welcome step: Centered overlay
+    if (!step.targetId) {
+      setHighlightStyle({ display: "none" });
+      setTooltipStyle({
+        position: "fixed",
+        left: "50%",
+        top: "50%",
+        transform: "translate(-50%, -50%)",
+        zIndex: 100002,
+        width: "360px"
+      });
+      return;
+    }
+    
+    // Measure coordinates instantly on the next layout paint frame
+    const animFrame = requestAnimationFrame(() => {
+      const el = document.getElementById(step.targetId);
+      if (!el) {
+        // Fallback to centered
+        setHighlightStyle({ display: "none" });
+        setTooltipStyle({
+          position: "fixed",
+          left: "50%",
+          top: "50%",
+          transform: "translate(-50%, -50%)",
+          zIndex: 100002,
+          width: "360px"
+        });
+        return;
+      }
+      
+      // Scroll target instantly into view
+      el.scrollIntoView({ behavior: "auto", block: "center" });
+      
+      const rect = el.getBoundingClientRect();
+      
+      // Highlight outline focus styles
+      setHighlightStyle({
+        position: "fixed",
+        left: `${rect.left - 4}px`,
+        top: `${rect.top - 4}px`,
+        width: `${rect.width + 8}px`,
+        height: `${rect.height + 8}px`,
+        borderRadius: "12px",
+        boxShadow: "0 0 0 99999px rgba(0, 0, 0, 0.75), 0 0 15px var(--accent)",
+        border: "2px solid var(--accent)",
+        zIndex: 100001,
+        pointerEvents: "none"
+      });
+      
+      let topVal = rect.bottom + 12;
+      let leftVal = rect.left + rect.width / 2;
+      let transformVal = "translateX(-50%)";
+      
+      // If the target is in the sidebar, position it to the right of the sidebar
+      if (isSidebarTarget) {
+        leftVal = rect.right + 16;
+        topVal = rect.top + rect.height / 2 - 80;
+        // Make sure it doesn't go off the top or bottom of the screen
+        if (topVal < 20) topVal = 20;
+        if (topVal + 240 > window.innerHeight) {
+          topVal = window.innerHeight - 260;
+        }
+        transformVal = "none";
+      } else {
+        // Main content or floating action buttons
+        const spaceBelow = window.innerHeight - rect.bottom;
+        if (spaceBelow < 180) {
+          topVal = rect.top - 200; // Position above target
+          if (topVal < 10) topVal = 10;
+        }
+        
+        const spaceRight = window.innerWidth - rect.right;
+        if (spaceRight < 180) {
+          leftVal = rect.right - 320;
+          transformVal = "none";
+        } else if (rect.left < 180) {
+          leftVal = rect.left;
+          transformVal = "none";
+        }
+      }
+      
+      setTooltipStyle({
+        position: "fixed",
+        left: `${leftVal}px`,
+        top: `${topVal}px`,
+        transform: transformVal,
+        zIndex: 100002,
+        width: "320px"
+      });
+    });
+    
+    return () => cancelAnimationFrame(animFrame);
+  }, [currentTourStep, isMobile]);
+
+  const dismissTour = useCallback(async () => {
+    setCurrentTourStep(null);
+    if (user) {
+      try {
+        await user.updateMetadata({
+          unsafeMetadata: {
+            hasCompletedTour: true
+          }
+        });
+      } catch (err) {
+        console.error("Failed to persist tour progress in Clerk:", err);
+      }
+    }
+  }, [user]);
+
+  const handleNextStep = useCallback(() => {
+    if (currentTourStep === null) return;
+    if (currentTourStep < tourSteps.length - 1) {
+      setCurrentTourStep(currentTourStep + 1);
+    } else {
+      dismissTour();
+    }
+  }, [currentTourStep, dismissTour]);
+
+  const handleBackStep = useCallback(() => {
+    if (currentTourStep === null || currentTourStep === 0) return;
+    setCurrentTourStep(currentTourStep - 1);
+  }, [currentTourStep]);
+
   const safeBookmarks = Array.isArray(bookmarks) ? bookmarks : [];
 
   const categories = ["All", ...Array.from(new Set(safeBookmarks.map(b => b.category).filter(Boolean)))];
 
-  const visible = safeBookmarks.filter(b =>
-    (activeCategory === "All" || b.category === activeCategory || b.status === "processing")
-  );
+  const visible = safeBookmarks.filter(b => {
+    const matchesCategory = (activeCategory === "All" || b.category === activeCategory || b.status === "processing");
+    const matchesTag = (!selectedTag || (b.tags && b.tags.includes(selectedTag)));
+    return matchesCategory && matchesTag;
+  });
 
   // ─── Styles ────────────────────────────────────────────────────────────────
 
@@ -717,14 +955,32 @@ export default function Home() {
                     <div style={{ fontSize: "15px", fontWeight: 700, color: "var(--text)", letterSpacing: "-0.3px" }}>AI Bookmark Vault</div>
                   </div>
                 </div>
-                {/* Clerk User Button */}
-                <UserButton appearance={{ elements: { userButtonAvatarBox: { width: "32px", height: "32px" } } }} />
+                <UserButton appearance={{ elements: { userButtonAvatarBox: { width: "32px", height: "32px" } } }}>
+                  <UserButton.MenuItems>
+                    <UserButton.Action 
+                      label="Restart Tutorial" 
+                      labelIcon={
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                          <circle cx="12" cy="12" r="10" />
+                          <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" />
+                          <line x1="12" y1="17" x2="12.01" y2="17" />
+                        </svg>
+                      }
+                      onClick={() => {
+                        setCurrentTourStep(0);
+                        if (isMobile) setIsSidebarOpen(true);
+                      }}
+                    />
+                    <UserButton.Action label="manageAccount" />
+                  </UserButton.MenuItems>
+                </UserButton>
               </div>
             </div>
 
         {/* Add button and Chat button */}
         <div style={{ padding: "0 16px 20px", display: "flex", flexDirection: "column", gap: "8px" }}>
           <button
+            id="add-btn"
             onClick={() => { setEditingId(null); setTitle(""); setUrl(""); setError(""); setIsDialogOpen(true); }}
             style={{
               width: "100%", padding: "10px 16px",
@@ -744,6 +1000,7 @@ export default function Home() {
           </button>
           
           <button
+            id="chat-btn"
             onClick={() => { setIsChatOpen(true); if (isMobile) setIsSidebarOpen(false); }}
             style={{
               width: "100%", padding: "10px 16px",
@@ -825,6 +1082,7 @@ export default function Home() {
           <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
             {/* Bookmarklet Drag-and-Drop Badge */}
             <div
+              id="bookmarklet-badge"
               style={{ width: "100%" }}
               dangerouslySetInnerHTML={{
                 __html: `<a href="javascript:(function(){var w=500,h=380,left=(screen.width/2)-(w/2),top=(screen.height/2)-(h/2),u=window.location.href,t=document.title;var p=window.open('http://localhost:3000/bookmarklet?url='+encodeURIComponent(u)+'&title='+encodeURIComponent(t),'Save Bookmark','width='+w+',height='+h+',top='+top+',left='+left+',scrollbars=no,resizable=no');if(!p||p.closed||typeof p.closed=='undefined'){alert('Popup blocked! Please allow popups for this site to use the Bookmarklet.');}else if(window.focus){p.focus()}})();" onclick="if(event.button === 0){ alert('Drag this link to your browser bookmarks bar to save pages with one click!'); event.preventDefault(); }" style="display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: rgba(139,92,246,0.1); border: 1px dashed rgba(139,92,246,0.3); border-radius: 10px; color: #a78bfa; font-size: 12px; text-decoration: none; font-weight: 500; cursor: grab; justify-content: center; transition: all 0.15s; user-select: none; -webkit-user-select: none; -moz-user-select: none; -ms-user-select: none; width: 100%; box-sizing: border-box;" title="Drag me to your bookmark bar!"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 4px; display: inline-block; vertical-align: middle;"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" /></svg>Drag to Bookmark Bar</a>`
@@ -833,6 +1091,7 @@ export default function Home() {
 
             {/* HTML Import Uploader */}
             <label
+              id="import-btn"
               style={{
                 display: "flex", alignItems: "center", gap: "8px",
                 padding: "8px 12px", background: "var(--surface)",
@@ -981,10 +1240,86 @@ export default function Home() {
                 ? `Showing results for "${searchQuery}"`
                 : `${visible.length} bookmark${visible.length !== 1 ? "s" : ""} saved`}
             </p>
+            
+            {/* Tag filter dismiss banner */}
+            {selectedTag && (
+              <div style={{ display: "flex", alignItems: "center", gap: "8px", marginTop: "12px" }}>
+                <span style={{ fontSize: "10px", color: "var(--text-muted)", fontWeight: 700, letterSpacing: "0.05em" }}>
+                  TAG FILTER:
+                </span>
+                <span
+                  onClick={() => setSelectedTag(null)}
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "4px",
+                    fontSize: "11px",
+                    padding: "3px 10px",
+                    borderRadius: "20px",
+                    background: "rgba(139, 92, 246, 0.15)",
+                    border: "1px solid rgba(139, 92, 246, 0.4)",
+                    color: "#a78bfa",
+                    cursor: "pointer",
+                    fontWeight: 600,
+                    transition: "all 0.15s"
+                  }}
+                  onMouseEnter={e => { (e.currentTarget as HTMLSpanElement).style.background = "rgba(139, 92, 246, 0.25)"; }}
+                  onMouseLeave={e => { (e.currentTarget as HTMLSpanElement).style.background = "rgba(139, 92, 246, 0.15)"; }}
+                >
+                  {selectedTag}
+                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" style={{ marginTop: "1px" }}>
+                    <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                  </svg>
+                </span>
+              </div>
+            )}
           </div>
 
+          {/* Skeleton Loader */}
+          {isBookmarksLoading && (
+            <div style={{ 
+              display: "grid", 
+              gridTemplateColumns: isMounted ? (isMobile ? "1fr" : "repeat(auto-fill, minmax(340px, 1fr))") : "repeat(auto-fill, minmax(340px, 1fr))", 
+              gap: "24px",
+              paddingBottom: "40px"
+            }}>
+              {[1, 2, 3, 4, 5, 6].map(i => (
+                <div 
+                  key={i}
+                  style={{
+                    background: "rgba(255,255,255,0.015)",
+                    border: "1px solid var(--border)",
+                    borderRadius: "16px",
+                    padding: "24px",
+                    height: "220px",
+                    display: "flex",
+                    flexDirection: "column",
+                    justifyContent: "space-between",
+                    animation: "pulse 1.5s infinite ease-in-out"
+                  }}
+                >
+                  <div>
+                    {/* Category skeleton */}
+                    <div style={{ width: "65px", height: "16px", background: "rgba(255,255,255,0.06)", borderRadius: "20px", marginBottom: "16px" }} />
+                    {/* Title skeleton */}
+                    <div style={{ width: "80%", height: "20px", background: "rgba(255,255,255,0.06)", borderRadius: "4px", marginBottom: "12px" }} />
+                    {/* Summary skeleton line 1 */}
+                    <div style={{ width: "100%", height: "12px", background: "rgba(255,255,255,0.04)", borderRadius: "3px", marginBottom: "8px" }} />
+                    {/* Summary skeleton line 2 */}
+                    <div style={{ width: "90%", height: "12px", background: "rgba(255,255,255,0.04)", borderRadius: "3px" }} />
+                  </div>
+                  {/* Tags skeleton */}
+                  <div style={{ display: "flex", gap: "8px" }}>
+                    <div style={{ width: "50px", height: "16px", background: "rgba(255,255,255,0.04)", borderRadius: "20px" }} />
+                    <div style={{ width: "65px", height: "16px", background: "rgba(255,255,255,0.04)", borderRadius: "20px" }} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
           {/* Empty state */}
-          {visible.length === 0 && (
+          {!isBookmarksLoading && visible.length === 0 && (
             <div style={{ textAlign: "center", paddingTop: "80px", color: "var(--text-muted)" }}>
               <div style={{
                 width: "72px", height: "72px", background: "var(--surface)",
@@ -1005,174 +1340,211 @@ export default function Home() {
           )}
 
           {/* Bookmark grid */}
-          <div style={{ 
-            display: "grid", 
-            gridTemplateColumns: isMounted ? (isMobile ? "1fr" : "repeat(auto-fill, minmax(340px, 1fr))") : "repeat(auto-fill, minmax(340px, 1fr))", 
-            gap: "16px" 
-          }}>
-            {visible.map((bookmark, index) => (
-              <div
-                key={bookmark.id}
-                style={{
-                  background: "rgba(255,255,255,0.025)", border: "1px solid var(--border)",
-                  borderRadius: "16px", padding: "20px",
-                  transition: "transform 0.2s, border-color 0.3s ease, box-shadow 0.2s, background-color 0.3s ease",
-                  animation: "fadeInUp 0.4s ease both",
-                  animationDelay: `${index * 0.05}s`,
-                }}
-                onMouseEnter={e => {
-                  const el = e.currentTarget as HTMLDivElement;
-                  el.style.transform = "translateY(-3px)";
-                  el.style.borderColor = "rgba(139,92,246,0.3)";
-                  el.style.boxShadow = "0 10px 36px rgba(139,92,246,0.1)";
-                }}
-                onMouseLeave={e => {
-                  const el = e.currentTarget as HTMLDivElement;
-                  el.style.transform = "translateY(0)";
-                  el.style.borderColor = "var(--border)";
-                  el.style.boxShadow = "none";
-                }}
-              >
-                {/* Card header row */}
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "12px" }}>
-                  <div style={{ display: "flex", alignItems: "center" }}>
-                    <span style={{
-                      fontSize: "11px", fontWeight: 600, padding: "3px 10px", borderRadius: "20px",
-                      background: bookmark.status === "processing" ? "rgba(255, 255, 255, 0.05)" : `${getCategoryColor(bookmark.category)}1a`,
-                      color: bookmark.status === "processing" ? "var(--text-muted)" : getCategoryColor(bookmark.category),
-                      border: `1px solid ${bookmark.status === "processing" ? "var(--border)" : `${getCategoryColor(bookmark.category)}33`}`,
-                      letterSpacing: "0.03em",
-                      transition: "background-color 0.3s ease, color 0.3s ease, border-color 0.3s ease",
-                    }}>
-                      {bookmark.status === "processing" ? "Analyzing..." : (bookmark.category || "Uncategorized")}
-                    </span>
-                    {bookmark.is_archived && (
+          {!isBookmarksLoading && visible.length > 0 && (
+            <div style={{ 
+              display: "grid", 
+              gridTemplateColumns: isMounted ? (isMobile ? "1fr" : "repeat(auto-fill, minmax(340px, 1fr))") : "repeat(auto-fill, minmax(340px, 1fr))", 
+              gap: "16px" 
+            }}>
+              {visible.map((bookmark, index) => (
+                <div
+                  key={bookmark.id}
+                  style={{
+                    background: "rgba(255,255,255,0.025)", border: "1px solid var(--border)",
+                    borderRadius: "16px", padding: "20px",
+                    transition: "transform 0.2s, border-color 0.3s ease, box-shadow 0.2s, background-color 0.3s ease",
+                    animation: "fadeInUp 0.4s ease both",
+                    animationDelay: `${index * 0.05}s`,
+                  }}
+                  onMouseEnter={e => {
+                    const el = e.currentTarget as HTMLDivElement;
+                    el.style.transform = "translateY(-3px)";
+                    el.style.borderColor = "rgba(139,92,246,0.3)";
+                    el.style.boxShadow = "0 10px 36px rgba(139,92,246,0.1)";
+                  }}
+                  onMouseLeave={e => {
+                    const el = e.currentTarget as HTMLDivElement;
+                    el.style.transform = "translateY(0)";
+                    el.style.borderColor = "var(--border)";
+                    el.style.boxShadow = "none";
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "12px" }}>
+                    <div style={{ display: "flex", alignItems: "center" }}>
                       <span style={{
-                        fontSize: "9px", fontWeight: 700, padding: "2px 6px", borderRadius: "4px",
-                        background: "rgba(239, 68, 68, 0.15)", color: "#ef4444", marginLeft: "6px"
+                        fontSize: "11px", fontWeight: 600, padding: "3px 10px", borderRadius: "20px",
+                        background: bookmark.status === "processing" ? "rgba(255, 255, 255, 0.05)" : `${getCategoryColor(bookmark.category)}1a`,
+                        color: bookmark.status === "processing" ? "var(--text-muted)" : getCategoryColor(bookmark.category),
+                        border: `1px solid ${bookmark.status === "processing" ? "var(--border)" : `${getCategoryColor(bookmark.category)}33`}`,
+                        letterSpacing: "0.03em",
+                        transition: "background-color 0.3s ease, color 0.3s ease, border-color 0.3s ease",
                       }}>
-                        ARCHIVED
+                        {bookmark.status === "processing" ? "Analyzing..." : (bookmark.category || "Uncategorized")}
                       </span>
-                    )}
-                  </div>
-                  <div style={{ display: "flex", gap: "6px" }}>
-                    <button
-                      onClick={() => toggleArchive(bookmark.id)}
-                      title={showArchived ? "Unarchive" : "Archive"}
-                      style={iconBtn}
-                      onMouseEnter={e => { const b = e.currentTarget as HTMLButtonElement; b.style.background = "rgba(139,92,246,0.1)"; b.style.color = "#8b5cf6"; b.style.borderColor = "rgba(139,92,246,0.3)"; }}
-                      onMouseLeave={e => { const b = e.currentTarget as HTMLButtonElement; b.style.background = "var(--surface)"; b.style.color = "var(--text-muted)"; b.style.borderColor = "var(--border)"; }}
-                    >
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                        <polyline points="21 8 21 21 3 21 3 8" />
-                        <rect x="1" y="3" width="22" height="5" />
-                        <line x1="10" y1="12" x2="14" y2="12" />
-                      </svg>
-                    </button>
-                    <button
-                      onClick={() => { if (bookmark.status !== "processing") openEdit(bookmark); }}
-                      disabled={bookmark.status === "processing"}
-                      title={bookmark.status === "processing" ? "AI is analyzing this bookmark" : "Edit"}
-                      style={{ ...iconBtn, opacity: bookmark.status === "processing" ? 0.4 : 1, cursor: bookmark.status === "processing" ? "not-allowed" : "pointer" }}
-                      onMouseEnter={e => {
-                        if (bookmark.status !== "processing") {
-                          const b = e.currentTarget as HTMLButtonElement; b.style.background = "var(--surface-hover)"; b.style.color = "var(--accent)";
-                        }
-                      }}
-                      onMouseLeave={e => {
-                        if (bookmark.status !== "processing") {
-                          const b = e.currentTarget as HTMLButtonElement; b.style.background = "var(--surface)"; b.style.color = "var(--text-muted)";
-                        }
-                      }}
-                    >
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                        <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
-                        <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
-                      </svg>
-                    </button>
-                    <button
-                      onClick={() => setDeleteTargetId(bookmark.id)}
-                      title="Delete"
-                      style={iconBtn}
-                      onMouseEnter={e => { const b = e.currentTarget as HTMLButtonElement; b.style.background = "rgba(239,68,68,0.1)"; b.style.color = "#ef4444"; b.style.borderColor = "rgba(239,68,68,0.3)"; }}
-                      onMouseLeave={e => { const b = e.currentTarget as HTMLButtonElement; b.style.background = "var(--surface)"; b.style.color = "var(--text-muted)"; b.style.borderColor = "var(--border)"; }}
-                    >
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                        <polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
-                        <path d="M10 11v6" /><path d="M14 11v6" />
-                        <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
-                      </svg>
-                    </button>
-                  </div>
-                </div>
-
-                {/* Title */}
-                <h3 style={{ fontSize: "15px", fontWeight: 700, color: "var(--text)", marginBottom: "8px", letterSpacing: "-0.2px", lineHeight: 1.4 }}>
-                  {bookmark.title || "Analyzing Title..."}
-                </h3>
-
-                {/* URL + date row */}
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "14px" }}>
-                  <a
-                    href={bookmark.url} target="_blank" rel="noreferrer"
-                    style={{
-                      fontSize: "12px", color: "var(--accent)", display: "flex",
-                      alignItems: "center", gap: "5px",
-                      textDecoration: "none", overflow: "hidden",
-                      whiteSpace: "nowrap", textOverflow: "ellipsis",
-                      flex: 1, minWidth: 0,
-                    }}
-                    onMouseEnter={e => (e.currentTarget as HTMLAnchorElement).style.textDecoration = "underline"}
-                    onMouseLeave={e => (e.currentTarget as HTMLAnchorElement).style.textDecoration = "none"}
-                  >
-                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
-                      <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
-                      <polyline points="15 3 21 3 21 9" /><line x1="10" y1="14" x2="21" y2="3" />
-                    </svg>
-                    {bookmark.url}
-                  </a>
-                  {bookmark.created_at && (
-                    <span style={{ fontSize: "11px", color: "var(--text-muted)", flexShrink: 0, marginLeft: "10px" }}>
-                      {timeAgo(bookmark.created_at)}
-                    </span>
-                  )}
-                </div>
-
-                {/* AI Summary */}
-                <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: "10px", padding: "12px" }}>
-                  <div style={{
-                    fontSize: "10px",
-                    fontWeight: 700,
-                    color: bookmark.status === "processing" ? "var(--text-muted)" : "var(--accent)",
-                    marginBottom: "6px",
-                    letterSpacing: "0.08em",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "6px",
-                  }}>
-                    {bookmark.status === "processing" && (
-                      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"
-                        style={{ animation: "spin 1s linear infinite" }}
+                      {bookmark.is_archived && (
+                        <span style={{
+                          fontSize: "9px", fontWeight: 700, padding: "2px 6px", borderRadius: "4px",
+                          background: "rgba(239, 68, 68, 0.15)", color: "#ef4444", marginLeft: "6px"
+                        }}>
+                          ARCHIVED
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ display: "flex", gap: "6px" }}>
+                      <button
+                        onClick={() => toggleArchive(bookmark.id)}
+                        title={showArchived ? "Unarchive" : "Archive"}
+                        style={iconBtn}
+                        onMouseEnter={e => { const b = e.currentTarget as HTMLButtonElement; b.style.background = "rgba(139,92,246,0.1)"; b.style.color = "#8b5cf6"; b.style.borderColor = "rgba(139,92,246,0.3)"; }}
+                        onMouseLeave={e => { const b = e.currentTarget as HTMLButtonElement; b.style.background = "var(--surface)"; b.style.color = "var(--text-muted)"; b.style.borderColor = "var(--border)"; }}
                       >
-                        <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
-                      </svg>
-                    )}
-                    {bookmark.status === "processing" ? "✦ AI ANALYZING..." : "✦ AI SUMMARY"}
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                          <polyline points="21 8 21 21 3 21 3 8" />
+                          <rect x="1" y="3" width="22" height="5" />
+                          <line x1="10" y1="12" x2="14" y2="12" />
+                        </svg>
+                      </button>
+                      <button
+                        onClick={() => { if (bookmark.status !== "processing") openEdit(bookmark); }}
+                        disabled={bookmark.status === "processing"}
+                        title={bookmark.status === "processing" ? "AI is analyzing this bookmark" : "Edit"}
+                        style={{ ...iconBtn, opacity: bookmark.status === "processing" ? 0.4 : 1, cursor: bookmark.status === "processing" ? "not-allowed" : "pointer" }}
+                        onMouseEnter={e => {
+                          if (bookmark.status !== "processing") {
+                            const b = e.currentTarget as HTMLButtonElement; b.style.background = "var(--surface-hover)"; b.style.color = "var(--accent)";
+                          }
+                        }}
+                        onMouseLeave={e => {
+                          if (bookmark.status !== "processing") {
+                            const b = e.currentTarget as HTMLButtonElement; b.style.background = "var(--surface)"; b.style.color = "var(--text-muted)";
+                          }
+                        }}
+                      >
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+                          <path d="M18.5 2.5a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
+                        </svg>
+                      </button>
+                      <button
+                        onClick={() => setDeleteTargetId(bookmark.id)}
+                        title="Delete"
+                        style={iconBtn}
+                        onMouseEnter={e => { const b = e.currentTarget as HTMLButtonElement; b.style.background = "rgba(239,68,68,0.1)"; b.style.color = "#ef4444"; b.style.borderColor = "rgba(239,68,68,0.3)"; }}
+                        onMouseLeave={e => { const b = e.currentTarget as HTMLButtonElement; b.style.background = "var(--surface)"; b.style.color = "var(--text-muted)"; b.style.borderColor = "var(--border)"; }}
+                      >
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                          <polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                          <path d="M10 11v6" /><path d="M14 11v6" />
+                          <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+                        </svg>
+                      </button>
+                    </div>
                   </div>
-                  <p style={{
-                    fontSize: "12.5px",
-                    color: bookmark.status === "processing" ? "var(--text-muted)" : "var(--text-secondary)",
-                    lineHeight: 1.65,
-                    margin: 0,
-                    animation: bookmark.status === "processing" ? "pulse 1.5s infinite ease-in-out" : "none",
-                    transition: "color 0.3s ease",
-                  }}>
-                    {bookmark.summary}
-                  </p>
+                  
+                  <h3 style={{ fontSize: "16px", fontWeight: 700, margin: "0 0 8px 0", color: "var(--text)", letterSpacing: "-0.2px" }}>
+                    <a 
+                      href={bookmark.url} 
+                      target="_blank" 
+                      rel="noopener noreferrer"
+                      style={{ color: "inherit", textDecoration: "none" }}
+                      onMouseEnter={e => e.currentTarget.style.color = "var(--accent)"}
+                      onMouseLeave={e => e.currentTarget.style.color = "inherit"}
+                    >
+                      {bookmark.title}
+                    </a>
+                  </h3>
+                  
+                  {/* Tags */}
+                  {bookmark.tags && bookmark.tags.length > 0 && (
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginBottom: "14px" }}>
+                      {bookmark.tags.map(tag => (
+                        <span
+                          key={tag}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setSelectedTag(tag === selectedTag ? null : tag);
+                          }}
+                          style={{
+                            fontSize: "11px",
+                            padding: "3px 10px",
+                            borderRadius: "20px",
+                            background: selectedTag === tag ? "rgba(139, 92, 246, 0.25)" : "rgba(139, 92, 246, 0.08)",
+                            border: `1px solid ${selectedTag === tag ? "rgba(139, 92, 246, 0.6)" : "rgba(139, 92, 246, 0.25)"}`,
+                            color: selectedTag === tag ? "#ffffff" : "#a78bfa",
+                            cursor: "pointer",
+                            transition: "all 0.2s ease",
+                            fontWeight: 600,
+                            letterSpacing: "0.02em",
+                          }}
+                          onMouseEnter={e => {
+                            if (selectedTag !== tag) {
+                              const target = e.currentTarget as HTMLSpanElement;
+                              target.style.background = "rgba(139, 92, 246, 0.15)";
+                              target.style.borderColor = "rgba(139, 92, 246, 0.4)";
+                              target.style.color = "#ffffff";
+                            }
+                          }}
+                          onMouseLeave={e => {
+                            if (selectedTag !== tag) {
+                              const target = e.currentTarget as HTMLSpanElement;
+                              target.style.background = "rgba(139, 92, 246, 0.08)";
+                              target.style.borderColor = "rgba(139, 92, 246, 0.25)";
+                              target.style.color = "#a78bfa";
+                            }
+                          }}
+                        >
+                          {tag}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* AI Summary */}
+                  <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: "10px", padding: "12px" }}>
+                    <div style={{
+                      fontSize: "10px",
+                      fontWeight: 700,
+                      color: bookmark.status === "processing" ? "var(--text-muted)" : "var(--accent)",
+                      marginBottom: "6px",
+                      letterSpacing: "0.08em",
+                      textTransform: "uppercase",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "6px",
+                    }}>
+                      {bookmark.status === "processing" ? (
+                        <>
+                          <svg className="animate-spin" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" style={{ animation: "spin 1s linear infinite" }}>
+                            <circle cx="12" cy="12" r="10" strokeDasharray="30 30" />
+                          </svg>
+                          Processing webpage...
+                        </>
+                      ) : (
+                        <>
+                          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                            <polygon points="12 2 2 7 12 12 22 7 12 2" />
+                            <polyline points="2 17 12 22 22 17" />
+                            <polyline points="2 12 17 22 12" />
+                          </svg>
+                          AI Summary
+                        </>
+                      )}
+                    </div>
+                    <p style={{
+                      fontSize: "12.5px",
+                      color: bookmark.status === "processing" ? "var(--text-muted)" : "var(--text-secondary)",
+                      lineHeight: 1.65,
+                      margin: 0,
+                      animation: bookmark.status === "processing" ? "pulse 1.5s infinite ease-in-out" : "none",
+                      transition: "color 0.3s ease",
+                    }}>
+                      {bookmark.summary}
+                    </p>
+                  </div>
                 </div>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          )}
         </div>
       </main>
 
@@ -1250,21 +1622,26 @@ export default function Home() {
               <div style={{ position: "relative" }}>
                 <select
                   value={selectedCategory ?? ""}
-                  onChange={e => setSelectedCategory(e.target.value || null)}
+                  onChange={e => {
+                    const val = e.target.value;
+                    setSelectedCategory(val || null);
+                    if (val !== "custom") setCustomCategory("");
+                  }}
                   style={{
                     ...inputStyle,
                     appearance: "none",
                     paddingRight: "36px",
                     cursor: "pointer",
-                    color: selectedCategory ? getCategoryColor(selectedCategory) : "var(--text-muted)",
+                    color: selectedCategory ? getCategoryColor(selectedCategory === "custom" ? customCategory : selectedCategory) : "var(--text-muted)",
                   }}
                   onFocus={e => e.target.style.borderColor = "var(--accent)"}
                   onBlur={e => e.target.style.borderColor = "var(--border)"}
                 >
                   <option value="">✦ Auto (AI picks)</option>
-                  {VALID_CATEGORIES.map(cat => (
+                  {categories.filter(c => c !== "All").map(cat => (
                     <option key={cat} value={cat}>{cat}</option>
                   ))}
+                  <option value="custom">+ Add Custom Category...</option>
                 </select>
                 {/* Chevron icon */}
                 <svg
@@ -1274,11 +1651,39 @@ export default function Home() {
                   <polyline points="6 9 12 15 18 9" />
                 </svg>
               </div>
+              {selectedCategory === "custom" && (
+                <div style={{ marginTop: "10px" }}>
+                  <input
+                    placeholder="Enter custom category name (e.g. Cooking, Finance)"
+                    value={customCategory}
+                    onChange={e => setCustomCategory(e.target.value)}
+                    style={inputStyle}
+                    onFocus={e => e.target.style.borderColor = "var(--accent)"}
+                    onBlur={e => e.target.style.borderColor = "var(--border)"}
+                  />
+                </div>
+              )}
               {!selectedCategory && (
                 <p style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "5px", marginBottom: 0 }}>
                   Gemini will assign a category automatically.
                 </p>
               )}
+            </div>
+
+            {/* Tags field */}
+            <div style={{ marginBottom: "20px" }}>
+              <label style={labelStyle}>TAGS</label>
+              <input
+                placeholder="e.g. nextjs, react, baking (comma-separated)"
+                value={dialogTags}
+                onChange={e => setDialogTags(e.target.value)}
+                style={inputStyle}
+                onFocus={e => e.target.style.borderColor = "var(--accent)"}
+                onBlur={e => e.target.style.borderColor = "var(--border)"}
+              />
+              <p style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "5px", marginBottom: 0 }}>
+                Separate tags with commas. Gemini will generate tags automatically if left empty.
+              </p>
             </div>
 
             {error && (
@@ -1586,6 +1991,106 @@ export default function Home() {
                   <line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" />
                 </svg>
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ══════════════════════════ GUIDED TOUR OVERLAY ══════════════════════ */}
+      {currentTourStep !== null && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 100000, pointerEvents: "auto" }}>
+          {/* Highlight cutout overlay */}
+          {/* Highlight cutout overlay */}
+          <div style={{
+            ...highlightStyle,
+            transition: "left 0.28s cubic-bezier(0.16, 1, 0.3, 1), top 0.28s cubic-bezier(0.16, 1, 0.3, 1), width 0.28s cubic-bezier(0.16, 1, 0.3, 1), height 0.28s cubic-bezier(0.16, 1, 0.3, 1)"
+          }} />
+          
+          {/* Static full screen backdrop fallback for Welcome step */}
+          {currentTourStep === 0 && (
+            <div 
+              style={{
+                position: "fixed",
+                inset: 0,
+                background: "rgba(0,0,0,0.7)",
+                backdropFilter: "blur(2px)",
+                zIndex: 100000,
+                transition: "all 0.3s ease"
+              }}
+            />
+          )}
+          
+          {/* Tour Tooltip Card */}
+          <div style={{
+            ...tooltipStyle,
+            background: "rgba(20, 20, 25, 0.75)",
+            backdropFilter: "blur(20px)",
+            border: "1px solid rgba(255, 255, 255, 0.08)",
+            borderRadius: "16px",
+            padding: "20px",
+            boxShadow: "0 20px 40px rgba(0,0,0,0.6)",
+            color: "var(--text)",
+            transition: "left 0.28s cubic-bezier(0.16, 1, 0.3, 1), top 0.28s cubic-bezier(0.16, 1, 0.3, 1)"
+          }}>
+            {/* Header */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
+              <span style={{ fontSize: "10px", fontWeight: 700, color: "var(--accent)", letterSpacing: "0.08em", textTransform: "uppercase" }}>
+                Vault Tour • Step {currentTourStep + 1} of {tourSteps.length}
+              </span>
+              <button 
+                onClick={dismissTour}
+                style={{ background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer", padding: "4px" }}
+              >
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                  <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
+              </button>
+            </div>
+            
+            {/* Title & Description */}
+            <h4 style={{ fontSize: "15px", fontWeight: 700, margin: "0 0 8px 0", color: "white" }}>
+              {tourSteps[currentTourStep].title}
+            </h4>
+            <p style={{ fontSize: "12.5px", color: "var(--text-secondary)", lineHeight: 1.6, margin: "0 0 20px 0" }}>
+              {tourSteps[currentTourStep].description}
+            </p>
+            
+            {/* Actions */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <button 
+                onClick={dismissTour}
+                style={{
+                  background: "none", border: "none", color: "var(--text-muted)",
+                  fontSize: "12px", cursor: "pointer", fontWeight: 500
+                }}
+              >
+                Skip Tour
+              </button>
+              
+              <div style={{ display: "flex", gap: "8px" }}>
+                {currentTourStep > 0 && (
+                  <button 
+                    onClick={handleBackStep}
+                    style={{
+                      background: "rgba(255,255,255,0.05)", border: "1px solid var(--border)",
+                      color: "var(--text-secondary)", padding: "6px 12px", borderRadius: "8px",
+                      fontSize: "12px", fontWeight: 600, cursor: "pointer", transition: "all 0.15s"
+                    }}
+                  >
+                    Back
+                  </button>
+                )}
+                <button 
+                  onClick={handleNextStep}
+                  style={{
+                    background: "linear-gradient(135deg, #8b5cf6, #6366f1)", border: "none",
+                    color: "white", padding: "6px 14px", borderRadius: "8px",
+                    fontSize: "12px", fontWeight: 600, cursor: "pointer", transition: "all 0.15s"
+                  }}
+                >
+                  {currentTourStep === tourSteps.length - 1 ? "Get Started" : "Next"}
+                </button>
+              </div>
             </div>
           </div>
         </div>

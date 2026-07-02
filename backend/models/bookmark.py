@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Boolean
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, JSON
 from sqlalchemy.sql import func
 from pgvector.sqlalchemy import Vector
 
@@ -25,5 +25,7 @@ class Bookmark(Base):
     is_archived = Column(Boolean, default=False, server_default="false")
 
     embedding = Column(Vector(768), nullable=True)
+
+    tags = Column(JSON, nullable=True)
 
     created_at = Column(DateTime, server_default=func.now())
