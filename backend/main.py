@@ -224,6 +224,21 @@ class BookmarkMessageResponse(BaseModel):
     data: BookmarkResponse
 
 
+class ChatMessage(BaseModel):
+    role: str  # "user" or "model"
+    content: str
+
+
+class ChatRequest(BaseModel):
+    message: str
+    history: List[ChatMessage] = []
+
+
+class ChatResponse(BaseModel):
+    response: str
+    sources: List[BookmarkResponse]
+
+
 # ── AI helper ────────────────────────────────────────────────────────────────
 
 VALID_CATEGORIES = [
@@ -552,3 +567,113 @@ def toggle_archive_bookmark(
         raise HTTPException(status_code=500, detail="Database transaction failed.")
         
     return bookmark
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_with_vault(
+    payload: ChatRequest,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user)
+):
+    clean_message = payload.message.strip()
+    if not clean_message:
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    # A. Generate embedding for query
+    query_vector = None
+    try:
+        embed_resp = await client.aio.models.embed_content(
+            model="gemini-embedding-001",
+            contents=clean_message,
+            config=types.EmbedContentConfig(output_dimensionality=768)
+        )
+        if embed_resp and embed_resp.embeddings:
+            query_vector = embed_resp.embeddings[0].values
+    except Exception as e:
+        logger.error(f"Failed to generate embedding for chat query: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to parse search query.")
+
+    if not query_vector:
+        raise HTTPException(status_code=500, detail="Failed to compute query vector representation.")
+
+    # B. Retrieve similar bookmarks using a safety distance threshold (DoS & Hallucination blocker)
+    try:
+        sources = (
+            db.query(Bookmark)
+            .filter(
+                Bookmark.user_id == user_id,
+                Bookmark.embedding.is_not(None),
+                Bookmark.is_archived == False,
+                Bookmark.embedding.cosine_distance(query_vector) < 0.65
+            )
+            .order_by(Bookmark.embedding.cosine_distance(query_vector))
+            .limit(5)
+            .all()
+        )
+    except Exception as e:
+        logger.error(f"Database query failure in RAG chat: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Database transaction failed.")
+
+    # Early exit if no bookmarks are related to the user's query
+    if not sources:
+        return {
+            "response": "I couldn't find any relevant bookmarks matching your question in your vault. Try saving more bookmarks or adjusting your query!",
+            "sources": []
+        }
+
+    # C. Compile prompt context
+    context_blocks = []
+    for i, b in enumerate(sources, 1):
+        scraped_content = b.summary or "No summary available."
+        context_blocks.append(
+            f"Source [{i}]:\n"
+            f"Title: {b.title}\n"
+            f"URL: {b.url}\n"
+            f"Summary: {scraped_content}\n"
+        )
+    
+    context_str = "\n\n".join(context_blocks)
+
+    system_instruction = (
+        "You are the AI Assistant for the user's Bookmark Vault.\n"
+        "Your task is to answer the user's question using ONLY the provided Source context list.\n"
+        "If the answer cannot be inferred from the context, respond saying you couldn't find the answer in their vault.\n"
+        "Format your answer in clean markdown. Cite the sources you refer to using bracketed index numbers "
+        "(e.g. [1], [2]) directly within your sentences (do not construct a separate sources list at the end)."
+    )
+
+    # Compile chat history and insert system instruction
+    contents = []
+    for msg in payload.history:
+        contents.append(
+            types.Content(
+                role=msg.role,
+                parts=[types.Part.from_text(text=msg.content)]
+            )
+        )
+    
+    # Append the current prompt containing the retrieved context
+    prompt = f"Context:\n{context_str}\n\nUser Question: {clean_message}"
+    contents.append(
+        types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=prompt)]
+        )
+    )
+
+    # D. Query Gemini
+    try:
+        response = await client.aio.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.3
+            )
+        )
+        ai_reply = response.text if response.text else "Sorry, I could not generate a response."
+    except Exception as e:
+        logger.error(f"Gemini generation failure in RAG chat: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="AI generation failed.")
+
+    return {"response": ai_reply, "sources": sources}

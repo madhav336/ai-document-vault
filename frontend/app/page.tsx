@@ -14,6 +14,90 @@ type Bookmark = {
   is_archived?: boolean;
 };
 
+type ChatMessage = {
+  role: 'user' | 'model';
+  content: string;
+  sources?: Bookmark[];
+};
+
+const renderFormattedText = (text: string, sources?: Bookmark[]) => {
+  if (!text) return null;
+  const lines = text.split("\n");
+  
+  return lines.map((line, lineIdx) => {
+    let cleanLine = line;
+    let isBullet = false;
+
+    // Detect bullet point: starts with "* " or "- "
+    if (cleanLine.trim().startsWith("* ") || cleanLine.trim().startsWith("- ")) {
+      isBullet = true;
+      // Strip out the bullet marker
+      const markerIndex = cleanLine.indexOf(cleanLine.trim().startsWith("* ") ? "*" : "-");
+      cleanLine = cleanLine.substring(markerIndex + 2);
+    }
+
+    // Parse bold tags "**bold**" and citations "[1]" inside the line
+    const elements: React.ReactNode[] = [];
+    const regex = /(\*\*.*?\*\*|\[\d+\])/g;
+    const tokens = cleanLine.split(regex);
+
+    tokens.forEach((token, tIdx) => {
+      if (token.startsWith("**") && token.endsWith("**")) {
+        const boldText = token.slice(2, -2);
+        elements.push(<strong key={tIdx} style={{ color: "var(--text)", fontWeight: 600 }}>{boldText}</strong>);
+      } else if (token.startsWith("[") && token.endsWith("]")) {
+        const sourceNum = parseInt(token.slice(1, -1), 10);
+        if (sources && sourceNum > 0 && sourceNum <= sources.length) {
+          const source = sources[sourceNum - 1];
+          elements.push(
+            <a 
+              key={tIdx}
+              href={source.url}
+              target="_blank"
+              rel="noreferrer"
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                fontSize: "10px",
+                fontWeight: 700,
+                padding: "1px 5px",
+                borderRadius: "4px",
+                background: "rgba(139,92,246,0.2)",
+                color: "#a78bfa",
+                textDecoration: "none",
+                margin: "0 2px",
+                verticalAlign: "super"
+              }}
+              title={source.title}
+            >
+              {sourceNum}
+            </a>
+          );
+        } else {
+          elements.push(token);
+        }
+      } else {
+        elements.push(token);
+      }
+    });
+
+    if (isBullet) {
+      return (
+        <div key={lineIdx} style={{ display: "flex", gap: "8px", marginLeft: "12px", marginBottom: "6px" }}>
+          <span style={{ color: "#a78bfa" }}>•</span>
+          <div>{elements}</div>
+        </div>
+      );
+    }
+
+    return (
+      <div key={lineIdx} style={{ marginBottom: "8px", minHeight: cleanLine.trim() === "" ? "8px" : "auto" }}>
+        {elements}
+      </div>
+    );
+  });
+};
+
 function timeAgo(dateStr: string): string {
   if (!dateStr) return "";
   
@@ -76,8 +160,21 @@ export default function Home() {
   // null = "Auto (AI)" — let backend Gemini decide
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [showArchived, setShowArchived] = useState(false);
+
+  // RAG Chat States
+  const [isChatOpen, setIsChatOpen] = useState(false);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [isChatLoading, setIsChatLoading] = useState(false);
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
   
   const { getToken } = useAuth();
+
+  useEffect(() => {
+    if (chatEndRef.current) {
+      chatEndRef.current.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [chatMessages]);
   
   const [isMounted, setIsMounted] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
@@ -351,6 +448,50 @@ export default function Home() {
     }
   }
 
+  async function sendChatMessage() {
+    if (!chatInput.trim() || isChatLoading) return;
+    const userMsg = chatInput.trim();
+    setChatInput("");
+    
+    const newUserMessage: ChatMessage = { role: 'user', content: userMsg };
+    const currentHistory = [...chatMessages];
+    setChatMessages(prev => [...prev, newUserMessage]);
+    setIsChatLoading(true);
+
+    try {
+      const token = await getToken();
+      const res = await fetch(`${API_BASE}/chat`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          message: userMsg,
+          history: currentHistory.map(m => ({ role: m.role, content: m.content }))
+        })
+      });
+      
+      if (!res.ok) throw new Error();
+      
+      const data = await res.json();
+      if (data) {
+        setChatMessages(prev => [...prev, {
+          role: 'model',
+          content: data.response,
+          sources: data.sources
+        }]);
+      }
+    } catch {
+      setChatMessages(prev => [...prev, {
+        role: 'model',
+        content: "Failed to connect to the assistant. Please verify your connection."
+      }]);
+    } finally {
+      setIsChatLoading(false);
+    }
+  }
+
   function openEdit(bookmark: Bookmark) {
     setTitle(bookmark.title);
     setUrl(bookmark.url);
@@ -534,8 +675,8 @@ export default function Home() {
               </div>
             </div>
 
-        {/* Add button */}
-        <div style={{ padding: "0 16px 20px" }}>
+        {/* Add button and Chat button */}
+        <div style={{ padding: "0 16px 20px", display: "flex", flexDirection: "column", gap: "8px" }}>
           <button
             onClick={() => { setEditingId(null); setTitle(""); setUrl(""); setError(""); setIsDialogOpen(true); }}
             style={{
@@ -553,6 +694,26 @@ export default function Home() {
               <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
             </svg>
             Add Bookmark
+          </button>
+          
+          <button
+            onClick={() => { setIsChatOpen(true); if (isMobile) setIsSidebarOpen(false); }}
+            style={{
+              width: "100%", padding: "10px 16px",
+              background: "rgba(139,92,246,0.12)",
+              border: "1px solid rgba(139,92,246,0.3)",
+              borderRadius: "12px", color: "#a78bfa",
+              fontSize: "14px", fontWeight: 600, cursor: "pointer",
+              display: "flex", alignItems: "center", justifyContent: "center", gap: "8px",
+              transition: "all 0.2s",
+            }}
+            onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.background = "rgba(139,92,246,0.18)"; }}
+            onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = "rgba(139,92,246,0.12)"; }}
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.8" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+            </svg>
+            Chat Assistant
           </button>
         </div>
 
@@ -1108,6 +1269,238 @@ export default function Home() {
                 onMouseLeave={e => (e.currentTarget as HTMLButtonElement).style.background = "#ef4444"}
               >
                 Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ══════════════════════════ AI CHAT DRAWER ════════════════════════════ */}
+      {isChatOpen && (
+        <div 
+          onClick={() => setIsChatOpen(false)} 
+          style={{
+            position: "fixed", top: 0, left: 0, right: 0, bottom: 0,
+            background: "rgba(0, 0, 0, 0.4)", backdropFilter: "blur(4px)",
+            zIndex: 200, display: "flex", justifyContent: "flex-end",
+            animation: "fadeIn 0.2s ease-out",
+          }}
+        >
+          <div
+            onClick={e => e.stopPropagation()}
+            style={{
+              width: isMobile ? "100%" : "420px", height: "100%",
+              background: "#0d0d15", borderLeft: "1px solid var(--border)",
+              display: "flex", flexDirection: "column",
+              boxShadow: "-10px 0 30px rgba(0,0,0,0.5)",
+              animation: "slideIn 0.25s cubic-bezier(0.16, 1, 0.3, 1)",
+            }}
+          >
+            {/* Drawer Header */}
+            <div style={{ padding: "20px 24px", borderBottom: "1px solid var(--border)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                <div style={{
+                  width: "30px", height: "30px",
+                  background: "rgba(139,92,246,0.18)",
+                  borderRadius: "8px", display: "flex", alignItems: "center", justifyContent: "center",
+                }}>
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                  </svg>
+                </div>
+                <div>
+                  <h3 style={{ fontSize: "16px", fontWeight: 700, color: "var(--text)", margin: 0 }}>AI Assistant</h3>
+                  <p style={{ fontSize: "11px", color: "var(--text-muted)", margin: "2px 0 0" }}>Ask about your vault</p>
+                </div>
+              </div>
+              <button 
+                onClick={() => setIsChatOpen(false)}
+                style={{
+                  background: "none", border: "none", color: "var(--text-muted)",
+                  cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
+                  padding: "6px", borderRadius: "50%",
+                  transition: "background 0.15s, color 0.15s"
+                }}
+                onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.background = "var(--surface-hover)"; (e.currentTarget as HTMLButtonElement).style.color = "var(--text)"; }}
+                onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = "none"; (e.currentTarget as HTMLButtonElement).style.color = "var(--text-muted)"; }}
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
+              </button>
+            </div>
+
+            {/* Message History area */}
+            <div style={{ flex: 1, overflowY: "auto", padding: "24px", display: "flex", flexDirection: "column", gap: "16px" }}>
+              {chatMessages.length === 0 ? (
+                <div style={{ height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", textAlign: "center", padding: "20px" }}>
+                  <div style={{
+                    width: "48px", height: "48px",
+                    background: "rgba(139,92,246,0.1)", border: "1px solid rgba(139,92,246,0.2)",
+                    borderRadius: "14px", display: "flex", alignItems: "center", justifyContent: "center",
+                    marginBottom: "16px", color: "#a78bfa"
+                  }}>
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                    </svg>
+                  </div>
+                  <h4 style={{ fontSize: "14px", fontWeight: 600, color: "var(--text)", marginBottom: "6px" }}>Start a Conversation</h4>
+                  <p style={{ fontSize: "12px", color: "var(--text-muted)", lineHeight: 1.6, maxWidth: "260px", marginBottom: "20px" }}>
+                    Ask questions using information across all your saved bookmark pages.
+                  </p>
+                  
+                  {/* Suggestions */}
+                  <div style={{ display: "flex", flexDirection: "column", gap: "8px", width: "100%" }}>
+                    {[
+                      "What tech stack references do I have?",
+                      "Summarize my DevOps bookmarks",
+                      "Find any resources about database designs"
+                    ].map(prompt => (
+                      <button
+                        key={prompt}
+                        onClick={() => { setChatInput(prompt); }}
+                        style={{
+                          width: "100%", padding: "10px 14px",
+                          background: "var(--surface)", border: "1px solid var(--border)",
+                          borderRadius: "10px", color: "var(--text-secondary)",
+                          fontSize: "12px", textAlign: "left", cursor: "pointer",
+                          transition: "all 0.15s",
+                        }}
+                        onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = "rgba(139,92,246,0.3)"; (e.currentTarget as HTMLButtonElement).style.background = "var(--surface-hover)"; }}
+                        onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = "var(--border)"; (e.currentTarget as HTMLButtonElement).style.background = "var(--surface)"; }}
+                      >
+                        {prompt}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {chatMessages.map((msg, idx) => (
+                    <div 
+                      key={idx}
+                      style={{
+                        display: "flex",
+                        flexDirection: "column",
+                        alignItems: msg.role === "user" ? "flex-end" : "flex-start",
+                        maxWidth: "85%",
+                        alignSelf: msg.role === "user" ? "flex-end" : "flex-start",
+                      }}
+                    >
+                      {/* Bubble */}
+                      <div
+                        style={{
+                          padding: "12px 16px",
+                          borderRadius: "14px",
+                          fontSize: "13px",
+                          lineHeight: 1.6,
+                          background: msg.role === "user" ? "var(--surface)" : "rgba(139,92,246,0.12)",
+                          border: msg.role === "user" ? "1px solid var(--border)" : "1px solid rgba(139,92,246,0.25)",
+                          color: "var(--text)",
+                          whiteSpace: "pre-wrap"
+                        }}
+                      >
+                        {msg.role === "model" 
+                          ? renderFormattedText(msg.content, msg.sources) 
+                          : msg.content
+                        }
+                      </div>
+
+                      {/* References / Sources list */}
+                      {msg.sources && msg.sources.length > 0 && (() => {
+                        // Extract referenced indices from msg.content (e.g. [2] -> index 2)
+                        const citedIndices = new Set(
+                          Array.from(msg.content.matchAll(/\[(\d+)\]/g)).map(match => parseInt(match[1], 10))
+                        );
+                        
+                        // Filter the sources array to only include cited ones
+                        const citedSources = msg.sources
+                          .map((src, sIdx) => ({ src, originalIdx: sIdx + 1 }))
+                          .filter(item => citedIndices.has(item.originalIdx));
+                        
+                        if (citedSources.length === 0) return null;
+
+                        return (
+                          <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginTop: "8px", paddingLeft: "4px" }}>
+                            <span style={{ fontSize: "10px", color: "var(--text-muted)", alignSelf: "center", marginRight: "4px" }}>
+                              SOURCES:
+                            </span>
+                            {citedSources.map(({ src, originalIdx }) => (
+                              <a
+                                key={src.id}
+                                href={src.url}
+                                target="_blank"
+                                rel="noreferrer"
+                                style={{
+                                  display: "inline-flex",
+                                  alignItems: "center",
+                                  gap: "4px",
+                                  fontSize: "10px",
+                                  padding: "2px 8px",
+                                  borderRadius: "6px",
+                                  background: "var(--surface)",
+                                  border: "1px solid var(--border)",
+                                  color: "var(--text-secondary)",
+                                  textDecoration: "none",
+                                  transition: "all 0.15s"
+                                }}
+                                onMouseEnter={e => { (e.currentTarget as HTMLAnchorElement).style.borderColor = "#a78bfa"; (e.currentTarget as HTMLAnchorElement).style.background = "var(--surface-hover)"; }}
+                                onMouseLeave={e => { (e.currentTarget as HTMLAnchorElement).style.borderColor = "var(--border)"; (e.currentTarget as HTMLAnchorElement).style.background = "var(--surface)"; }}
+                              >
+                                <span style={{ fontWeight: 700, color: "#a78bfa" }}>{originalIdx}</span>
+                                <span style={{ maxWidth: "80px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                  {src.title || "Source"}
+                                </span>
+                              </a>
+                            ))}
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  ))}
+                  
+                  {isChatLoading && (
+                    <div style={{ display: "flex", gap: "8px", alignItems: "center", alignSelf: "flex-start", background: "rgba(139,92,246,0.06)", border: "1px solid rgba(139,92,246,0.15)", borderRadius: "12px", padding: "10px 14px" }}>
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" strokeWidth="3"
+                        style={{ animation: "spin 0.8s linear infinite" }}>
+                        <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+                      </svg>
+                      <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>Analyzing context...</span>
+                    </div>
+                  )}
+                  <div ref={chatEndRef} />
+                </>
+              )}
+            </div>
+
+            {/* Input area */}
+            <div style={{ padding: "20px 24px", borderTop: "1px solid var(--border)", display: "flex", gap: "10px" }}>
+              <input
+                placeholder="Ask your vault..."
+                value={chatInput}
+                onChange={e => setChatInput(e.target.value)}
+                onKeyDown={e => { if (e.key === "Enter") sendChatMessage(); }}
+                disabled={isChatLoading}
+                style={{ ...inputStyle, flex: 1, padding: "10px 14px" }}
+                onFocus={e => e.target.style.borderColor = "var(--accent)"}
+                onBlur={e => e.target.style.borderColor = "var(--border)"}
+              />
+              <button
+                onClick={sendChatMessage}
+                disabled={!chatInput.trim() || isChatLoading}
+                style={{
+                  padding: "10px 14px",
+                  background: (!chatInput.trim() || isChatLoading) ? "var(--surface)" : "linear-gradient(135deg, #8b5cf6, #6366f1)",
+                  border: "none", borderRadius: "12px",
+                  color: (!chatInput.trim() || isChatLoading) ? "var(--text-muted)" : "white",
+                  cursor: (!chatInput.trim() || isChatLoading) ? "not-allowed" : "pointer",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  transition: "opacity 0.2s"
+                }}
+              >
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.8" strokeLinecap="round" strokeLinejoin="round">
+                  <line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" />
+                </svg>
               </button>
             </div>
           </div>
