@@ -837,6 +837,7 @@ export default function Home() {
             {/* Bookmarklet Drag-and-Drop Badge */}
             <a
               ref={bookmarkletRef}
+              draggable={true}
               onClick={e => {
                 // Prevent navigation when clicking, but allow dragging
                 if (e.button === 0) {
@@ -850,7 +851,11 @@ export default function Home() {
                 border: "1px dashed rgba(139,92,246,0.3)", borderRadius: "10px",
                 color: "#a78bfa", fontSize: "12px", textDecoration: "none",
                 fontWeight: 500, cursor: "grab", justifyContent: "center",
-                transition: "all 0.15s"
+                transition: "all 0.15s",
+                userSelect: "none",
+                WebkitUserSelect: "none",
+                MozUserSelect: "none",
+                msUserSelect: "none"
               }}
               title="Drag me to your bookmark bar!"
             >
