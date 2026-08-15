@@ -1,10 +1,19 @@
+import hashlib
 import os
+from datetime import datetime, timezone
+
 import jwt
 from jwt import PyJWKClient
-from fastapi import HTTPException, Security
+from fastapi import Depends, Header, HTTPException, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy.orm import Session
 
-security = HTTPBearer()
+from database import get_db
+from models.api_key import ApiKey
+
+# auto_error=False: extension requests authenticate via X-API-Key instead of
+# a Bearer token, so a missing Authorization header must not short-circuit here.
+security = HTTPBearer(auto_error=False)
 
 CLERK_PEM_PUBLIC_KEY = os.getenv("CLERK_PEM_PUBLIC_KEY")
 CLERK_JWKS_URL = os.getenv("CLERK_JWKS_URL")
@@ -32,8 +41,12 @@ if not CLERK_PEM_PUBLIC_KEY and not CLERK_JWKS_URL:
             "Set CLERK_BYPASS_VERIFICATION=true in your .env for local offline development."
         )
 
-def get_current_user(credentials: HTTPAuthorizationCredentials = Security(security)) -> str:
-    token = credentials.credentials
+
+def hash_api_key(raw_key: str) -> str:
+    return hashlib.sha256(raw_key.encode()).hexdigest()
+
+
+def _verify_clerk_jwt(token: str) -> str:
     try:
         if CLERK_BYPASS_VERIFICATION:
             # Mode C: Fallback local development bypass (signature not verified)
@@ -44,7 +57,7 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Security(securi
             if not pem_key.startswith("-----BEGIN PUBLIC KEY-----"):
                 # Format to multi-line PEM format standard if raw string is provided
                 pem_key = f"-----BEGIN PUBLIC KEY-----\n{pem_key}\n-----END PUBLIC KEY-----"
-            
+
             decoded = jwt.decode(
                 token,
                 pem_key,
@@ -74,3 +87,28 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Security(securi
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Security(security),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    db: Session = Depends(get_db),
+) -> str:
+    # Personal API keys (browser extension, scripts): resolved to the same
+    # user_id scoping used for Clerk-authenticated web app requests.
+    if x_api_key:
+        key_hash = hash_api_key(x_api_key)
+        api_key = db.query(ApiKey).filter(ApiKey.key_hash == key_hash).first()
+        if not api_key:
+            raise HTTPException(status_code=401, detail="Invalid API key")
+        api_key.last_used_at = datetime.now(timezone.utc)
+        db.commit()
+        return api_key.user_id
+
+    if credentials is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return _verify_clerk_jwt(credentials.credentials)
