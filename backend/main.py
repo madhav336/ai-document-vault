@@ -1,26 +1,50 @@
+import hashlib
 import json
 import os
-import time
 import asyncio
-import threading
 import logging
-from datetime import datetime
+import secrets
+from datetime import datetime, timedelta
 from typing import List
 from urllib.parse import urlparse
 
+import jwt as pyjwt
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from bs4 import BeautifulSoup
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy.orm import Session
-from sqlalchemy import or_, text
+from sqlalchemy import or_, func
 from google import genai
 from google.genai import types
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
-from database import engine, Base, SessionLocal
-from models.bookmark import Bookmark
-from auth import get_current_user
+from database import SessionLocal, get_db
+from models.bookmark import Bookmark, BookmarkStatus, SourceType
+from models.api_key import ApiKey
+from models.ai_usage import AIUsage
+from models.chunk import Chunk
+from auth import get_current_user, hash_api_key
 from scraper import scrape_url
+import storage
+import chunking
+from extractors import (
+    extract_url,
+    extract_file,
+    source_type_for_filename,
+    ExtractionError,
+    SUPPORTED_UPLOAD_LABEL,
+)
+from extractors.base import ExtractedContent
+
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "20"))
+EMBED_BATCH_SIZE = 100
+CHAT_CHUNK_TOP_K = 8
+CHAT_CHUNK_DISTANCE = 0.65
+CHAT_CONTEXT_CHAR_BUDGET = 12000
 
 logger = logging.getLogger("main")
 
@@ -28,94 +52,8 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 app = FastAPI()
 
-# 1. Enable pgvector extension before creating tables
-try:
-    with engine.begin() as conn:
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-    print("pgvector extension verified/created.")
-except Exception as e:
-    print("Failed to verify/create pgvector extension:", e)
-
-# 2. Run SQLAlchemy metadata mapping
-Base.metadata.create_all(bind=engine)
-
-def run_migrations():
-    # A. Check and add status column
-    has_status = True
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT status FROM bookmarks LIMIT 1"))
-    except Exception:
-        has_status = False
-
-    if not has_status:
-        try:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE bookmarks ADD COLUMN status VARCHAR DEFAULT 'completed'"))
-            print("Database migration: status column successfully added to bookmarks table.")
-        except Exception as e:
-            print("Failed to run status column migration:", e)
-
-    # B. Check and add embedding column
-    has_embedding = True
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT embedding FROM bookmarks LIMIT 1"))
-    except Exception:
-        has_embedding = False
-
-    if not has_embedding:
-        try:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE bookmarks ADD COLUMN embedding vector(768)"))
-            print("Database migration: embedding column successfully added.")
-        except Exception as e:
-            print("Failed to run embedding column migration:", e)
-
-    # C. Check and add is_archived column
-    has_is_archived = True
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT is_archived FROM bookmarks LIMIT 1"))
-    except Exception:
-        has_is_archived = False
-
-    if not has_is_archived:
-        try:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE bookmarks ADD COLUMN is_archived BOOLEAN DEFAULT FALSE"))
-            print("Database migration: is_archived column successfully added.")
-        except Exception as e:
-            print("Failed to run is_archived column migration:", e)
-
-    # D. HNSW Index creation
-    try:
-        with engine.begin() as conn:
-            conn.execute(text(
-                "CREATE INDEX IF NOT EXISTS bookmarks_embedding_hnsw_idx "
-                "ON bookmarks USING hnsw (embedding vector_cosine_ops)"
-            ))
-        print("Database migration: HNSW vector index verified/created.")
-    except Exception as e:
-        print("Failed to run HNSW vector index migration:", e)
-
-    # E. Check and add tags column
-    has_tags = True
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT tags FROM bookmarks LIMIT 1"))
-    except Exception:
-        has_tags = False
-
-    if not has_tags:
-        try:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE bookmarks ADD COLUMN tags JSON"))
-            print("Database migration: tags column successfully added.")
-        except Exception as e:
-            print("Failed to run tags column migration:", e)
-
-run_migrations()
+# Schema is managed by Alembic (see backend/migrations/). Run `alembic upgrade head`
+# to apply pending migrations before starting the app.
 
 ENVIRONMENT = (os.getenv("ENVIRONMENT", "") or os.getenv("ENV", "")).lower()
 is_production = ENVIRONMENT.startswith("prod")
@@ -147,44 +85,29 @@ app.add_middleware(
 )
 
 
-# ── DB dependency ────────────────────────────────────────────────────────────
+# ── Rate Limiter ─────────────────────────────────────────────────────────────
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+def rate_limit_key(request: Request) -> str:
+    """Key rate limits by the authenticated Clerk user when available, falling
+    back to client IP for unauthenticated/malformed requests. The JWT is decoded
+    without signature verification here purely for bucketing — real auth/authorization
+    still happens in get_current_user via FastAPI's dependency injection."""
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header[7:]
+        try:
+            decoded = pyjwt.decode(token, options={"verify_signature": False})
+            sub = decoded.get("sub")
+            if sub:
+                return sub
+        except Exception:
+            pass
+    return get_remote_address(request)
 
-
-# ── Rate Limiter Dependency ──────────────────────────────────────────────────
-
-class RateLimiter:
-    def __init__(self, requests_limit: int, window_seconds: int):
-        self.requests_limit = requests_limit
-        self.window_seconds = window_seconds
-        self.history = {}
-        self.lock = threading.Lock()
-
-    def __call__(self, request: Request, user_id: str = Depends(get_current_user)):
-        now = time.time()
-        key = user_id or (request.client.host if request.client else "unknown")
-        
-        with self.lock:
-            user_history = self.history.get(key, [])
-            user_history = [t for t in user_history if now - t < self.window_seconds]
-            
-            if len(user_history) >= self.requests_limit:
-                raise HTTPException(
-                    status_code=429,
-                    detail="Rate limit exceeded. Please try again later."
-                )
-            
-            user_history.append(now)
-            self.history[key] = user_history
-
-save_limiter = RateLimiter(requests_limit=5, window_seconds=60)
-search_limiter = RateLimiter(requests_limit=20, window_seconds=60)
+limiter = Limiter(key_func=rate_limit_key)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
@@ -231,19 +154,27 @@ class BookmarkAI(BaseModel):
     summary: str
     category: str
     tags: List[str]
+    key_insight: str
 
 
 class BookmarkResponse(BaseModel):
     id: int
     title: str | None = None
-    url: str
+    url: str | None = None
     summary: str | None = None
+    key_insight: str | None = None
     category: str | None = None
     user_id: str | None = None
-    status: str
+    status: BookmarkStatus
     is_archived: bool = False
     created_at: datetime
     tags: List[str] = []
+    source_type: SourceType = SourceType.URL
+    file_name: str | None = None
+    file_type: str | None = None
+    page_count: int | None = None
+    has_file: bool = False
+    error_reason: str | None = None
 
     @field_validator("tags", mode="before")
     @classmethod
@@ -260,8 +191,7 @@ class BookmarkResponse(BaseModel):
             return [str(item) for item in v]
         return []
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class BookmarkMessageResponse(BaseModel):
@@ -282,6 +212,32 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     response: str
     sources: List[BookmarkResponse]
+
+
+class ApiKeyCreateRequest(BaseModel):
+    name: str
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def clean_name(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("Name cannot be empty")
+        return v[:100]
+
+
+class ApiKeyResponse(BaseModel):
+    id: int
+    name: str
+    key_prefix: str
+    created_at: datetime
+    last_used_at: datetime | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ApiKeyCreatedResponse(ApiKeyResponse):
+    key: str  # raw key, returned only once at creation time
 
 
 # ── AI helper ────────────────────────────────────────────────────────────────
@@ -312,6 +268,7 @@ async def generate_summary(title: str, url: str, scraped_text: str | None = None
     prompt += f"""
     Return a JSON object containing:
     - summary: A concise 2-3 sentence description of what this resource is about.
+    - key_insight: A single declarative sentence of 10-15 words capturing the most immediately useful thing about this resource. Write it as a direct statement, not a question. Example: "Benchmarks comparing React SSR hydration strategies with interactive code examples."
     - category: A VERY broad capitalized category name (e.g., 'Tech', 'Cooking', 'Finance', 'Design', 'Lifestyle', 'News', 'Education', 'Other'). Do not use specific technical subcategories like 'Frontend', 'Backend', 'AI/ML', 'DevOps', 'Mobile', 'Security', or 'Programming' as categories; classify them all under 'Tech' instead.{categories_ctx}
     - tags: An array of 3-5 specific subcategory keyword tags (lowercase, alphanumeric, no spaces, e.g. "nextjs", "react", "baking", "desserts", "programming", "mobile", "security").
     """
@@ -320,7 +277,7 @@ async def generate_summary(title: str, url: str, scraped_text: str | None = None
     for attempt in range(max_retries):
         try:
             response = await client.aio.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3-flash-preview",
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
@@ -335,12 +292,19 @@ async def generate_summary(title: str, url: str, scraped_text: str | None = None
                     data["category"] = "Other"
             else:
                 data["category"] = "Other"
-            
+
             if "tags" in data and isinstance(data["tags"], list):
                 data["tags"] = list(set(str(t).strip().lower() for t in data["tags"] if str(t).strip()))
             else:
                 data["tags"] = []
-                
+
+            # Sanitize key_insight: strip whitespace, enforce a 200-char cap, fall back to None
+            raw_insight = data.get("key_insight", "")
+            if isinstance(raw_insight, str) and raw_insight.strip():
+                data["key_insight"] = raw_insight.strip()[:200]
+            else:
+                data["key_insight"] = None
+
             return data
         except Exception as e:
             error_str = str(e)
@@ -353,83 +317,272 @@ async def generate_summary(title: str, url: str, scraped_text: str | None = None
                 logger.error(f"AI Summary failure on attempt {attempt+1}: {e}", exc_info=True)
                 raise e
 
+# ── Gemini cost controls ─────────────────────────────────────────────────────
+# The only paid piece of this stack is the Gemini API key. These two helpers
+# keep spend bounded and low as more people use the app: reuse enrichment
+# results across users for identical URLs, and cap Gemini-consuming actions
+# per user per day so no single user (or bug) can run away with the bill.
+
+GEMINI_DAILY_QUOTA_PER_USER = int(os.getenv("GEMINI_DAILY_QUOTA_PER_USER", "50"))
+
+
+def check_and_consume_ai_quota(db: Session, user_id: str) -> bool:
+    """Returns True and consumes one unit of quota if the user is under their
+    daily Gemini-usage cap, False if they've hit it."""
+    today = datetime.utcnow().date()
+    row = (
+        db.query(AIUsage)
+        .filter(AIUsage.user_id == user_id, AIUsage.usage_date == today)
+        .first()
+    )
+    if row is None:
+        row = AIUsage(user_id=user_id, usage_date=today, count=0)
+        db.add(row)
+        db.flush()
+
+    if row.count >= GEMINI_DAILY_QUOTA_PER_USER:
+        return False
+
+    row.count += 1
+    db.commit()
+    return True
+
+
+def find_reusable_enrichment(db: Session, item: Bookmark) -> Bookmark | None:
+    """Find any user's already-completed enrichment for the same source so a
+    re-added item costs zero Gemini calls. URLs match on url; uploaded files
+    match on content_hash."""
+    query = db.query(Bookmark).filter(
+        Bookmark.id != item.id,
+        Bookmark.status == BookmarkStatus.COMPLETED,
+        Bookmark.embedding.is_not(None),
+    )
+    if item.source_type == SourceType.URL and item.url:
+        query = query.filter(Bookmark.url == item.url)
+    elif item.content_hash:
+        query = query.filter(Bookmark.content_hash == item.content_hash)
+    else:
+        return None
+    return query.order_by(Bookmark.created_at.desc()).first()
+
+
+async def embed_texts(texts: List[str]) -> List[list | None]:
+    """Batch-embed a list of texts, returning one vector per input (None where a
+    batch failed). Batching keeps Gemini call count and rate low for big docs."""
+    results: List[list | None] = []
+    for start in range(0, len(texts), EMBED_BATCH_SIZE):
+        batch = texts[start:start + EMBED_BATCH_SIZE]
+        vectors: List[list | None] = [None] * len(batch)
+        for attempt in range(3):
+            try:
+                resp = await client.aio.models.embed_content(
+                    model="gemini-embedding-001",
+                    contents=batch,
+                    config=types.EmbedContentConfig(output_dimensionality=768),
+                )
+                if resp and resp.embeddings:
+                    for i, emb in enumerate(resp.embeddings):
+                        if i < len(vectors):
+                            vectors[i] = emb.values
+                break
+            except Exception as e:
+                if attempt < 2:
+                    await asyncio.sleep(1.0 * (attempt + 1))
+                else:
+                    logger.error(f"Embedding batch failed after retries: {e}")
+        results.extend(vectors)
+    return results
+
+
+async def _build_and_store_chunks(db: Session, item: Bookmark, content: ExtractedContent):
+    """Chunk the extracted text, embed the chunks in batches, and replace the
+    item's chunk rows. Falls back to a single summary-derived chunk so every
+    completed item is always retrievable in chat."""
+    # Re-enrich cleanly: drop any existing chunks first (no duplicates).
+    db.query(Chunk).filter(Chunk.document_id == item.id).delete()
+
+    if content.pages:
+        text_chunks, truncated = chunking.chunk_pages(content.pages)
+    else:
+        text_chunks, truncated = chunking.chunk_text(content.text or "")
+
+    stored = 0
+    if text_chunks:
+        vectors = await embed_texts([c.content for c in text_chunks])
+        for tc, vec in zip(text_chunks, vectors):
+            if vec is None:
+                continue
+            db.add(Chunk(
+                document_id=item.id,
+                user_id=item.user_id,
+                chunk_index=tc.index,
+                content=tc.content,
+                page_number=tc.page_number,
+                embedding=vec,
+            ))
+            stored += 1
+
+    # Safety net: guarantee at least one retrievable chunk using the summary
+    # embedding we already computed (zero extra Gemini cost).
+    if stored == 0 and item.embedding is not None:
+        db.add(Chunk(
+            document_id=item.id,
+            user_id=item.user_id,
+            chunk_index=0,
+            content=item.summary or item.title or "",
+            page_number=None,
+            embedding=item.embedding,
+        ))
+
+    if truncated and content.page_count:
+        item.error_reason = f"Large document — indexed the first {chunking.MAX_CHUNKS_PER_DOC} sections for search."
+
+
 # ── Background Worker Task ───────────────────────────────────────────────────
 
-async def enrich_bookmark_task(bookmark_id: int, user_category: str | None = None, user_tags: List[str] | None = None):
+async def enrich_item_task(
+    bookmark_id: int,
+    user_category: str | None = None,
+    user_tags: List[str] | None = None,
+    stagger_index: int = 0
+):
     """
-    Background worker task to scrape a webpage and generate AI metadata.
-    Uses an isolated database session context.
+    Background worker: extract text (URL scrape or file parse), generate AI
+    metadata + a summary embedding, and index the content as chunks for RAG.
+    Uses an isolated DB session. stagger_index spreads concurrent bulk jobs.
     """
+    if stagger_index > 0:
+        await asyncio.sleep(stagger_index * 0.5)
     db = SessionLocal()
     try:
-        bookmark = db.query(Bookmark).filter(Bookmark.id == bookmark_id).first()
-        if not bookmark:
+        item = db.query(Bookmark).filter(Bookmark.id == bookmark_id).first()
+        if not item:
+            return
+
+        # 0. Reuse an existing identical-source enrichment — zero Gemini calls.
+        reusable = find_reusable_enrichment(db, item)
+        if reusable:
+            if not item.title:
+                item.title = reusable.title
+            item.summary = reusable.summary
+            item.key_insight = reusable.key_insight
+            item.category = user_category or reusable.category
+            item.tags = user_tags if user_tags is not None else reusable.tags
+            item.embedding = reusable.embedding
+            item.error_reason = None
+            item.status = BookmarkStatus.COMPLETED
+            db.flush()
+            # Copy the source's chunks (with their embeddings) — no re-embedding.
+            db.query(Chunk).filter(Chunk.document_id == item.id).delete()
+            for src in db.query(Chunk).filter(Chunk.document_id == reusable.id).all():
+                db.add(Chunk(
+                    document_id=item.id, user_id=item.user_id, chunk_index=src.chunk_index,
+                    content=src.content, page_number=src.page_number, embedding=src.embedding,
+                ))
+            db.commit()
+            return
+
+        # 0b. Per-user daily Gemini cap (one unit per enrichment; MAX_CHUNKS_PER_DOC
+        # bounds the calls within a single large document).
+        if not check_and_consume_ai_quota(db, item.user_id):
+            item.status = BookmarkStatus.FAILED
+            item.error_reason = "Daily AI usage limit reached. Retry this item tomorrow."
+            if not item.category:
+                item.category = user_category or "Other"
+            if item.tags is None:
+                item.tags = user_tags or []
+            db.commit()
             return
 
         existing_categories = []
         try:
             existing_categories = [
                 r[0] for r in db.query(Bookmark.category)
-                .filter(Bookmark.user_id == bookmark.user_id)
+                .filter(Bookmark.user_id == item.user_id)
                 .distinct().all()
                 if r[0]
             ]
         except Exception as e:
-            logger.warning(f"Failed to fetch existing categories for user {bookmark.user_id}: {e}")
+            logger.warning(f"Failed to fetch existing categories for user {item.user_id}: {e}")
 
-        # 1. Web scraping
-        scraped = await scrape_url(bookmark.url)
-        
-        # Fallback to scraped title if user didn't enter one, and save default title
-        if not bookmark.title:
-            bookmark.title = scraped.get("title") or "Untitled Bookmark"
-        title_to_use = bookmark.title
+        # 1. Extract text via the right extractor for this source type.
+        try:
+            if item.source_type == SourceType.URL:
+                content = await extract_url(item.url)
+            else:
+                file_bytes = await asyncio.get_running_loop().run_in_executor(
+                    None, storage.get_object, item.storage_key
+                )
+                content = await asyncio.get_running_loop().run_in_executor(
+                    None, extract_file, item.source_type, file_bytes, item.file_name or "file"
+                )
+        except ExtractionError as ee:
+            item.status = BookmarkStatus.FAILED
+            item.error_reason = ee.reason
+            if not item.category:
+                item.category = user_category or "Other"
+            if item.tags is None:
+                item.tags = user_tags or []
+            db.commit()
+            return
 
-        # 2. Call Gemini
-        scraped_text = scraped.get("text") or scraped.get("description")
-        ai = await generate_summary(title_to_use, bookmark.url, scraped_text, existing_categories)
+        if not item.title:
+            item.title = content.title or item.file_name or "Untitled"
+        if content.page_count is not None:
+            item.page_count = content.page_count
+        title_to_use = item.title
+        source_label = item.url or f"(uploaded file: {item.file_name})"
+        body_text = content.text or content.description or ""
 
-        # 3. Save summary, category, and tags
-        bookmark.summary = ai["summary"]
-        bookmark.category = user_category or ai["category"]
-        bookmark.tags = user_tags if user_tags is not None else ai["tags"]
+        # 2. Summary / category / tags.
+        ai = await generate_summary(title_to_use, source_label, body_text, existing_categories)
+        item.summary = ai["summary"]
+        item.key_insight = ai.get("key_insight")
+        item.category = user_category or ai["category"]
+        item.tags = user_tags if user_tags is not None else ai["tags"]
 
-        # 4. Generate Vector Embedding with Rich Content Representation (Resilient to failure)
-        scraped_text_snippet = f"\nContent: {scraped_text[:1500]}" if scraped_text else ""
-        tags_str = f"\nTags: {', '.join(bookmark.tags)}" if bookmark.tags else ""
+        # 3. Item-level summary embedding (powers card search + related).
+        tags_str = f"\nTags: {', '.join(item.tags)}" if item.tags else ""
+        body_snippet = f"\nContent: {body_text[:1500]}" if body_text else ""
         text_to_embed = (
-            f"Title: {title_to_use}\n"
-            f"Category: {bookmark.category}\n"
-            f"Summary: {bookmark.summary}"
-            f"{tags_str}"
-            f"{scraped_text_snippet}"
+            f"Title: {title_to_use}\nCategory: {item.category}\nSummary: {item.summary}{tags_str}{body_snippet}"
         )
         try:
             embed_resp = await client.aio.models.embed_content(
                 model="gemini-embedding-001",
                 contents=text_to_embed,
-                config=types.EmbedContentConfig(output_dimensionality=768)
+                config=types.EmbedContentConfig(output_dimensionality=768),
             )
             if embed_resp and embed_resp.embeddings:
-                bookmark.embedding = embed_resp.embeddings[0].values
+                item.embedding = embed_resp.embeddings[0].values
         except Exception as embed_err:
-            logger.error(f"Failed to generate embedding for bookmark {bookmark_id}: {embed_err}")
+            logger.error(f"Failed summary embedding for item {bookmark_id}: {embed_err}")
 
-        # 5. Complete task
-        bookmark.status = "completed"
+        db.flush()
+
+        # 4. Chunk-level embeddings (powers deep RAG chat retrieval).
+        try:
+            await _build_and_store_chunks(db, item, content)
+        except Exception as chunk_err:
+            logger.error(f"Chunk indexing failed for item {bookmark_id}: {chunk_err}")
+
+        # 5. Complete.
+        item.status = BookmarkStatus.COMPLETED
         db.commit()
     except Exception as e:
         db.rollback()
-        logger.error(f"Error in background task for bookmark {bookmark_id}: {e}")
+        logger.error(f"Error in enrich task for item {bookmark_id}: {e}")
         try:
-            bookmark = db.query(Bookmark).filter(Bookmark.id == bookmark_id).first()
-            if bookmark:
-                bookmark.status = "failed"
-                bookmark.summary = "AI summarization failed."
-                if not bookmark.category:
-                    bookmark.category = user_category or "Other"
-                if bookmark.tags is None:
-                    bookmark.tags = user_tags or []
+            item = db.query(Bookmark).filter(Bookmark.id == bookmark_id).first()
+            if item:
+                item.status = BookmarkStatus.FAILED
+                item.error_reason = item.error_reason or "Processing failed. You can retry from the item."
+                if not item.summary:
+                    item.summary = "Processing failed."
+                if not item.category:
+                    item.category = user_category or "Other"
+                if item.tags is None:
+                    item.tags = user_tags or []
                 db.commit()
         except Exception:
             pass
@@ -437,7 +590,8 @@ async def enrich_bookmark_task(bookmark_id: int, user_category: str | None = Non
         db.close()
 
 
-# Startup event and backfill embeddings task removed to simplify deployment and save API quotas
+# Backwards-compatible alias for existing references.
+enrich_bookmark_task = enrich_item_task
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
@@ -460,8 +614,21 @@ def get_bookmarks(
     )
 
 
-@app.get("/search", response_model=List[BookmarkResponse], dependencies=[Depends(search_limiter)])
-async def search_bookmarks(q: str, db: Session = Depends(get_db), user_id: str = Depends(get_current_user)):
+@app.get("/bookmarks/{bookmark_id}", response_model=BookmarkResponse)
+def get_bookmark(
+    bookmark_id: int,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user)
+):
+    bookmark = db.query(Bookmark).filter(Bookmark.id == bookmark_id, Bookmark.user_id == user_id).first()
+    if not bookmark:
+        raise HTTPException(status_code=404, detail="Bookmark not found")
+    return bookmark
+
+
+@app.get("/search", response_model=List[BookmarkResponse])
+@limiter.limit("20/minute")
+async def search_bookmarks(request: Request, q: str, db: Session = Depends(get_db), user_id: str = Depends(get_current_user)):
     from sqlalchemy import cast, String
     clean_q = q.strip()[:500]
     if not clean_q:
@@ -478,6 +645,7 @@ async def search_bookmarks(q: str, db: Session = Depends(get_db), user_id: str =
             or_(
                 Bookmark.title.ilike(f"%{term}%"),
                 Bookmark.url.ilike(f"%{term}%"),
+                Bookmark.file_name.ilike(f"%{term}%"),
                 Bookmark.summary.ilike(f"%{term}%"),
                 Bookmark.category.ilike(f"%{term}%"),
                 cast(Bookmark.tags, String).ilike(f"%{term}%")
@@ -495,18 +663,21 @@ async def search_bookmarks(q: str, db: Session = Depends(get_db), user_id: str =
         logger.error(f"Failed to execute keyword search: {e}", exc_info=True)
         keyword_results = []
 
-    # 2. Fetch Vector Results (Semantic conceptual recommendations)
+    # 2. Fetch Vector Results (Semantic conceptual recommendations) — skipped
+    # (falling back to keyword-only results) once the user hits their daily
+    # Gemini quota, rather than failing the whole search.
     query_vector = None
-    try:
-        embed_resp = await client.aio.models.embed_content(
-            model="gemini-embedding-001",
-            contents=clean_q,
-            config=types.EmbedContentConfig(output_dimensionality=768)
-        )
-        if embed_resp and embed_resp.embeddings:
-            query_vector = embed_resp.embeddings[0].values
-    except Exception as e:
-        logger.error(f"Failed to embed search query: {e}")
+    if check_and_consume_ai_quota(db, user_id):
+        try:
+            embed_resp = await client.aio.models.embed_content(
+                model="gemini-embedding-001",
+                contents=clean_q,
+                config=types.EmbedContentConfig(output_dimensionality=768)
+            )
+            if embed_resp and embed_resp.embeddings:
+                query_vector = embed_resp.embeddings[0].values
+        except Exception as e:
+            logger.error(f"Failed to embed search query: {e}")
 
     vector_results = []
     if query_vector:
@@ -540,8 +711,10 @@ async def search_bookmarks(q: str, db: Session = Depends(get_db), user_id: str =
     return combined
 
 
-@app.post("/bookmarks", response_model=BookmarkMessageResponse, dependencies=[Depends(save_limiter)])
+@app.post("/bookmarks", response_model=BookmarkMessageResponse)
+@limiter.limit("5/minute")
 def create_bookmark(
+    request: Request,
     bookmark: BookmarkSchema,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
@@ -554,7 +727,8 @@ def create_bookmark(
         summary="AI is analyzing...",
         category=user_category or "Other",
         user_id=user_id,
-        status="processing",
+        status=BookmarkStatus.PROCESSING,
+        source_type=SourceType.URL,
         tags=bookmark.tags
     )
     db.add(new_bookmark)
@@ -566,8 +740,96 @@ def create_bookmark(
         logger.error(f"Database transaction failure in create_bookmark: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Database transaction failed.")
 
-    background_tasks.add_task(enrich_bookmark_task, new_bookmark.id, user_category, bookmark.tags)
+    background_tasks.add_task(enrich_item_task, new_bookmark.id, user_category, bookmark.tags)
     return {"message": "Bookmark added", "data": new_bookmark}
+
+
+@app.post("/documents/upload", response_model=BookmarkMessageResponse)
+@limiter.limit("10/minute")
+async def upload_document(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
+):
+    if not storage.is_configured():
+        raise HTTPException(status_code=503, detail="File uploads aren't configured on this server yet.")
+
+    file_name = file.filename or "file"
+    source_type = source_type_for_filename(file_name)
+    if source_type is None:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type. Supported: {SUPPORTED_UPLOAD_LABEL}.")
+
+    # Read with a hard cap so a huge upload can't buffer the whole file into memory.
+    max_bytes = MAX_UPLOAD_MB * 1024 * 1024
+    data = await file.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise HTTPException(status_code=400, detail=f"File exceeds the {MAX_UPLOAD_MB} MB limit.")
+    if not data:
+        raise HTTPException(status_code=400, detail="This file is empty.")
+
+    content_hash = hashlib.sha256(data).hexdigest()
+
+    # Gentle non-blocking notice if the same user already has this exact file.
+    already = (
+        db.query(Bookmark)
+        .filter(
+            Bookmark.user_id == user_id,
+            Bookmark.content_hash == content_hash,
+            Bookmark.is_archived == False,
+        )
+        .first()
+    )
+
+    # Store the original FIRST — never create a row pointing at a missing file.
+    storage_key = storage.build_key(user_id, file_name)
+    try:
+        await asyncio.get_running_loop().run_in_executor(
+            None, lambda: storage.put_object(storage_key, data, file.content_type)
+        )
+    except storage.StorageError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    new_item = Bookmark(
+        title=None,
+        url=None,
+        summary="AI is analyzing...",
+        category="Other",
+        user_id=user_id,
+        status=BookmarkStatus.PROCESSING,
+        source_type=source_type,
+        file_name=file_name,
+        file_type=file.content_type,
+        file_size=len(data),
+        content_hash=content_hash,
+        storage_key=storage_key,
+    )
+    db.add(new_item)
+    try:
+        db.commit()
+        db.refresh(new_item)
+    except Exception as e:
+        db.rollback()
+        storage.delete_object(storage_key)  # best-effort cleanup of the orphaned object
+        logger.error(f"DB failure in upload_document: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Database transaction failed.")
+
+    background_tasks.add_task(enrich_item_task, new_item.id)
+    message = "Already in your vault — re-processing." if already else "Document uploaded"
+    return {"message": message, "data": new_item}
+
+
+@app.get("/documents/{bookmark_id}/file")
+def get_document_file(bookmark_id: int, db: Session = Depends(get_db), user_id: str = Depends(get_current_user)):
+    item = db.query(Bookmark).filter(Bookmark.id == bookmark_id, Bookmark.user_id == user_id).first()
+    if not item or not item.storage_key:
+        raise HTTPException(status_code=404, detail="No file for this item.")
+    try:
+        url = storage.presigned_get_url(item.storage_key, item.file_name)
+    except storage.StorageError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return {"url": url}
 
 
 @app.delete("/bookmarks/{bookmark_id}")
@@ -575,18 +837,23 @@ def delete_bookmark(bookmark_id: int, db: Session = Depends(get_db), user_id: st
     bookmark = db.query(Bookmark).filter(Bookmark.id == bookmark_id, Bookmark.user_id == user_id).first()
     if not bookmark:
         raise HTTPException(status_code=404, detail="Bookmark not found")
-    db.delete(bookmark)
+    storage_key = bookmark.storage_key  # capture before delete
+    db.delete(bookmark)  # chunks cascade at the DB level
     try:
         db.commit()
     except Exception as e:
         db.rollback()
         logger.error(f"Database transaction failure in delete_bookmark: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Database transaction failed.")
+    if storage_key:
+        storage.delete_object(storage_key)  # best-effort; never blocks the delete
     return {"message": "Bookmark deleted"}
 
 
-@app.put("/bookmarks/{bookmark_id}", response_model=BookmarkMessageResponse, dependencies=[Depends(save_limiter)])
+@app.put("/bookmarks/{bookmark_id}", response_model=BookmarkMessageResponse)
+@limiter.limit("5/minute")
 def update_bookmark(
+    request: Request,
     bookmark_id: int,
     updated: BookmarkSchema,
     background_tasks: BackgroundTasks,
@@ -605,7 +872,7 @@ def update_bookmark(
         not bookmark.summary or 
         bookmark.summary == "Summary unavailable." or
         bookmark.summary == "AI is analyzing..." or
-        bookmark.status in ["failed", "processing"]
+        bookmark.status in [BookmarkStatus.FAILED, BookmarkStatus.PROCESSING]
     )
 
     bookmark.title = updated.title
@@ -613,7 +880,7 @@ def update_bookmark(
     bookmark.tags = updated.tags
 
     if needs_enrichment:
-        bookmark.status = "processing"
+        bookmark.status = BookmarkStatus.PROCESSING
         bookmark.summary = "AI is re-analyzing..."
         try:
             db.commit()
@@ -660,6 +927,100 @@ def toggle_archive_bookmark(
     return bookmark
 
 
+@app.get("/bookmarks/{bookmark_id}/related", response_model=List[BookmarkResponse])
+def get_related_bookmarks(
+    bookmark_id: int,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user)
+):
+    """
+    Returns up to 5 bookmarks from the user's vault that are semantically
+    similar to the given bookmark, using cosine distance on stored embeddings.
+    Zero Gemini API calls — queries existing vectors only.
+    """
+    source = db.query(Bookmark).filter(
+        Bookmark.id == bookmark_id,
+        Bookmark.user_id == user_id
+    ).first()
+
+    if not source:
+        raise HTTPException(status_code=404, detail="Bookmark not found")
+
+    # If the source has no embedding yet (still processing), return empty
+    if source.embedding is None:
+        return []
+
+    try:
+        related = (
+            db.query(Bookmark)
+            .filter(
+                Bookmark.user_id == user_id,
+                Bookmark.id != bookmark_id,
+                Bookmark.embedding.is_not(None),
+                Bookmark.is_archived == False,
+                Bookmark.embedding.cosine_distance(source.embedding) < 0.45
+            )
+            .order_by(Bookmark.embedding.cosine_distance(source.embedding))
+            .limit(5)
+            .all()
+        )
+    except Exception as e:
+        logger.error(f"Failed to execute related bookmarks query for {bookmark_id}: {e}", exc_info=True)
+        return []
+
+    return related
+
+
+@app.get("/stats")
+def get_vault_stats(
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user)
+):
+    """
+    Returns a summary of the user's vault: total count, recent activity,
+    and a category breakdown. Zero Gemini API calls.
+    """
+    try:
+        total = db.query(func.count(Bookmark.id)).filter(
+            Bookmark.user_id == user_id,
+            Bookmark.is_archived == False
+        ).scalar() or 0
+
+        archived_count = db.query(func.count(Bookmark.id)).filter(
+            Bookmark.user_id == user_id,
+            Bookmark.is_archived == True
+        ).scalar() or 0
+
+        thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+        recent_count = db.query(func.count(Bookmark.id)).filter(
+            Bookmark.user_id == user_id,
+            Bookmark.created_at >= thirty_days_ago
+        ).scalar() or 0
+
+        category_rows = (
+            db.query(Bookmark.category, func.count(Bookmark.id))
+            .filter(
+                Bookmark.user_id == user_id,
+                Bookmark.is_archived == False,
+                Bookmark.category.is_not(None)
+            )
+            .group_by(Bookmark.category)
+            .order_by(func.count(Bookmark.id).desc())
+            .all()
+        )
+
+        return {
+            "total": total,
+            "archived": archived_count,
+            "recent_30d": recent_count,
+            "category_count": len(category_rows),
+            "categories": [{"name": row[0], "count": row[1]} for row in category_rows]
+        }
+    except Exception as e:
+        logger.error(f"Failed to compute vault stats for user: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to retrieve vault statistics.")
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat_with_vault(
     payload: ChatRequest,
@@ -669,6 +1030,14 @@ async def chat_with_vault(
     clean_message = payload.message.strip()
     if not clean_message:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    # Chat needs two Gemini calls (embed + generate) per message, so it's
+    # gated by the daily quota rather than degrading gracefully like search.
+    if not check_and_consume_ai_quota(db, user_id):
+        return {
+            "response": "You've reached your daily AI usage limit. Please try chatting again tomorrow.",
+            "sources": []
+        }
 
     # A. Generate embedding for query
     query_vector = None
@@ -687,55 +1056,66 @@ async def chat_with_vault(
     if not query_vector:
         raise HTTPException(status_code=500, detail="Failed to compute query vector representation.")
 
-    # B. Retrieve similar bookmarks using a safety distance threshold (DoS & Hallucination blocker)
+    # B. Retrieve the most relevant CHUNKS across the user's items (page-level RAG),
+    # under a distance threshold so irrelevant content never reaches the prompt.
     try:
-        sources = (
-            db.query(Bookmark)
+        chunk_hits = (
+            db.query(Chunk, Bookmark)
+            .join(Bookmark, Chunk.document_id == Bookmark.id)
             .filter(
-                Bookmark.user_id == user_id,
-                Bookmark.embedding.is_not(None),
+                Chunk.user_id == user_id,
+                Chunk.embedding.is_not(None),
                 Bookmark.is_archived == False,
-                Bookmark.embedding.cosine_distance(query_vector) < 0.65
+                Chunk.embedding.cosine_distance(query_vector) < CHAT_CHUNK_DISTANCE,
             )
-            .order_by(Bookmark.embedding.cosine_distance(query_vector))
-            .limit(5)
+            .order_by(Chunk.embedding.cosine_distance(query_vector))
+            .limit(CHAT_CHUNK_TOP_K)
             .all()
         )
     except Exception as e:
         logger.error(f"Database query failure in RAG chat: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Database transaction failed.")
 
-    # Early exit if no bookmarks are related to the user's query
-    if not sources:
+    if not chunk_hits:
         return {
-            "response": "I couldn't find any relevant bookmarks matching your question in your vault. Try saving more bookmarks or adjusting your query!",
+            "response": "I couldn't find anything relevant in your vault for that. Try saving more, or rephrasing your question.",
             "sources": []
         }
 
-    # C. Compile prompt context
+    # C. Build a deduped, ordered source list (one citation index per document,
+    # even when several of its chunks were retrieved) and a char-budgeted context.
+    sources = []              # ordered unique parent documents
+    source_index = {}         # document_id -> citation number
     context_blocks = []
-    for i, b in enumerate(sources, 1):
-        scraped_content = b.summary or "No summary available."
-        context_blocks.append(
-            f"Source [{i}]:\n"
-            f"Title: {b.title}\n"
-            f"URL: {b.url}\n"
-            f"Summary: {scraped_content}\n"
-        )
-    
+    budget = CHAT_CONTEXT_CHAR_BUDGET
+    for chunk, doc in chunk_hits:
+        if doc.id not in source_index:
+            sources.append(doc)
+            source_index[doc.id] = len(sources)
+        idx = source_index[doc.id]
+        loc = f", p. {chunk.page_number}" if chunk.page_number else ""
+        piece = chunk.content[:budget]
+        budget -= len(piece)
+        context_blocks.append(f"Source [{idx}] ({doc.title or doc.file_name or 'Untitled'}{loc}):\n{piece}")
+        if budget <= 0:
+            break
+
     context_str = "\n\n".join(context_blocks)
 
     system_instruction = (
-        "You are the AI Assistant for the user's Bookmark Vault.\n"
-        "Your task is to answer the user's question using ONLY the provided Source context list.\n"
-        "If the answer cannot be inferred from the context, respond saying you couldn't find the answer in their vault.\n"
+        "You are the AI Assistant for the user's document vault (saved links and uploaded documents).\n"
+        "Answer the user's question using ONLY the provided Source context list.\n"
+        "If the answer cannot be inferred from the context, say you couldn't find it in their vault.\n"
         "Format your answer in clean markdown. Cite the sources you refer to using bracketed index numbers "
         "(e.g. [1], [2]) directly within your sentences (do not construct a separate sources list at the end)."
     )
 
-    # Compile chat history and insert system instruction
+    # Compile chat history — cap at last 20 messages to control Gemini token costs.
+    # Older context is less relevant and significantly inflates input token counts.
+    trimmed_history = payload.history[-20:] if len(payload.history) > 20 else payload.history
+
     contents = []
-    for msg in payload.history:
+    for msg in trimmed_history:
         contents.append(
             types.Content(
                 role=msg.role,
@@ -755,7 +1135,7 @@ async def chat_with_vault(
     # D. Query Gemini
     try:
         response = await client.aio.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3-flash-preview",
             contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
@@ -768,6 +1148,58 @@ async def chat_with_vault(
         raise HTTPException(status_code=500, detail="AI generation failed.")
 
     return {"response": ai_reply, "sources": sources}
+
+
+# ── API Keys (used by the browser extension) ─────────────────────────────────
+
+@app.post("/api-keys", response_model=ApiKeyCreatedResponse)
+def create_api_key(
+    payload: ApiKeyCreateRequest,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
+):
+    raw_key = f"abv_{secrets.token_urlsafe(32)}"
+    api_key = ApiKey(
+        user_id=user_id,
+        name=payload.name,
+        key_hash=hash_api_key(raw_key),
+        key_prefix=raw_key[:12],
+    )
+    db.add(api_key)
+    try:
+        db.commit()
+        db.refresh(api_key)
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Database transaction failure in create_api_key: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Database transaction failed.")
+
+    return ApiKeyCreatedResponse(key=raw_key, **ApiKeyResponse.model_validate(api_key).model_dump())
+
+
+@app.get("/api-keys", response_model=List[ApiKeyResponse])
+def list_api_keys(db: Session = Depends(get_db), user_id: str = Depends(get_current_user)):
+    return (
+        db.query(ApiKey)
+        .filter(ApiKey.user_id == user_id)
+        .order_by(ApiKey.created_at.desc())
+        .all()
+    )
+
+
+@app.delete("/api-keys/{key_id}")
+def delete_api_key(key_id: int, db: Session = Depends(get_db), user_id: str = Depends(get_current_user)):
+    api_key = db.query(ApiKey).filter(ApiKey.id == key_id, ApiKey.user_id == user_id).first()
+    if not api_key:
+        raise HTTPException(status_code=404, detail="API key not found")
+    db.delete(api_key)
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Database transaction failure in delete_api_key: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Database transaction failed.")
+    return {"message": "API key revoked"}
 
 
 @app.post("/bookmarks/import")
@@ -832,7 +1264,7 @@ async def import_bookmarks_html(
             title=title,
             url=url_str,
             category="Other",
-            status="processing",
+            status=BookmarkStatus.PROCESSING,
             summary="Queued for bulk AI analysis..."
         )
         bookmarks_to_create.append(bookmark)
@@ -858,9 +1290,11 @@ async def import_bookmarks_html(
         raise HTTPException(status_code=500, detail="Database transaction failed during bulk import.")
 
     # 3. Async Background Task Scheduling
+    # Tasks are staggered by 0.5s each to prevent a thundering-herd of concurrent
+    # Gemini API calls when importing many bookmarks at once.
     if background_tasks:
-        for b in bookmarks_to_create:
-            background_tasks.add_task(enrich_bookmark_task, b.id)
+        for index, b in enumerate(bookmarks_to_create):
+            background_tasks.add_task(enrich_bookmark_task, b.id, stagger_index=index)
 
     return {
         "message": f"Successfully imported {imported_count} bookmarks. Skipped {skipped_count} duplicates/invalid links.",

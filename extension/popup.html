@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>AI Bookmark Vault</title>
+  <style>
+    body {
+      width: 280px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0d0d15;
+      color: #e5e5ea;
+      padding: 16px;
+      margin: 0;
+    }
+    h1 {
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      margin: 0 0 12px;
+      color: #a78bfa;
+    }
+    label {
+      display: block;
+      font-size: 11px;
+      color: #9ca3af;
+      margin-bottom: 4px;
+      margin-top: 10px;
+    }
+    input {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 8px 10px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid #2a2a35;
+      border-radius: 8px;
+      color: #e5e5ea;
+      font-size: 12px;
+    }
+    button {
+      width: 100%;
+      margin-top: 14px;
+      padding: 9px;
+      background: linear-gradient(135deg, #8b5cf6, #6366f1);
+      border: none;
+      border-radius: 8px;
+      color: white;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button.secondary {
+      background: rgba(255, 255, 255, 0.06);
+      margin-top: 8px;
+    }
+    #status {
+      font-size: 11px;
+      margin-top: 10px;
+      min-height: 14px;
+    }
+  </style>
+</head>
+<body>
+  <h1>AI Bookmark Vault</h1>
+
+  <label for="apiBaseUrl">Backend API URL</label>
+  <input id="apiBaseUrl" type="text" placeholder="http://127.0.0.1:8000" />
+
+  <label for="apiKey">Personal API key</label>
+  <input id="apiKey" type="password" placeholder="abv_..." />
+
+  <button id="saveSettings">Save Settings</button>
+  <button id="saveCurrentPage" class="secondary">Save Current Page</button>
+
+  <div id="status"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
