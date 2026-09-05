@@ -209,9 +209,16 @@ class ChatRequest(BaseModel):
     history: List[ChatMessage] = []
 
 
+class ChatSource(BookmarkResponse):
+    # Pages of this document that actually contributed a retrieved passage to
+    # the prompt, ascending. Empty for URLs and for formats without pages
+    # (txt/md/docx), so the UI shows a page reference only when there is one.
+    cited_pages: List[int] = []
+
+
 class ChatResponse(BaseModel):
     response: str
-    sources: List[BookmarkResponse]
+    sources: List[ChatSource]
 
 
 class ApiKeyCreateRequest(BaseModel):
@@ -469,6 +476,10 @@ async def enrich_item_task(
             item.category = user_category or reusable.category
             item.tags = user_tags if user_tags is not None else reusable.tags
             item.embedding = reusable.embedding
+            # Carry over derived metadata too, so a deduped document isn't missing
+            # the page count the UI shows next to its type.
+            if item.page_count is None:
+                item.page_count = reusable.page_count
             item.error_reason = None
             item.status = BookmarkStatus.COMPLETED
             db.flush()
@@ -1086,6 +1097,7 @@ async def chat_with_vault(
     # even when several of its chunks were retrieved) and a char-budgeted context.
     sources = []              # ordered unique parent documents
     source_index = {}         # document_id -> citation number
+    pages_by_doc = {}         # document_id -> set of pages that reached the prompt
     context_blocks = []
     budget = CHAT_CONTEXT_CHAR_BUDGET
     for chunk, doc in chunk_hits:
@@ -1096,6 +1108,10 @@ async def chat_with_vault(
         loc = f", p. {chunk.page_number}" if chunk.page_number else ""
         piece = chunk.content[:budget]
         budget -= len(piece)
+        # Recorded here, inside the loop, so a page is only ever reported when
+        # its passage actually made it into the context before the budget ran out.
+        if chunk.page_number:
+            pages_by_doc.setdefault(doc.id, set()).add(chunk.page_number)
         context_blocks.append(f"Source [{idx}] ({doc.title or doc.file_name or 'Untitled'}{loc}):\n{piece}")
         if budget <= 0:
             break
@@ -1147,7 +1163,15 @@ async def chat_with_vault(
         logger.error(f"Gemini generation failure in RAG chat: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="AI generation failed.")
 
-    return {"response": ai_reply, "sources": sources}
+    # Attach the contributing page numbers so citations can point at a page,
+    # not just a document.
+    chat_sources = []
+    for doc in sources:
+        source_model = ChatSource.model_validate(doc)
+        source_model.cited_pages = sorted(pages_by_doc.get(doc.id, ()))
+        chat_sources.append(source_model)
+
+    return {"response": ai_reply, "sources": chat_sources}
 
 
 # ── API Keys (used by the browser extension) ─────────────────────────────────

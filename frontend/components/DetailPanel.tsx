@@ -85,13 +85,13 @@ export default function DetailPanel({
       className={
         isMobile
           ? "flex h-full w-full flex-col border-l border-(--border) bg-(--surface-overlay) shadow-(--shadow-lg)"
-          : "fixed bottom-0 right-0 top-15 z-90 flex w-105 flex-col border-l border-(--border) bg-(--surface-overlay) shadow-(--shadow-lg)"
+          : "fixed bottom-0 right-0 top-0 z-90 flex w-105 flex-col border-l border-(--border) bg-(--surface-overlay) shadow-(--shadow-lg)"
       }
-      style={{ animation: "slideInRight var(--transition-smooth) both", height: isMobile ? "100%" : "calc(100vh - 60px)" }}
+      style={{ animation: "slideInRight var(--transition-smooth) both", height: "100%" }}
     >
       {/* Panel Header */}
       <div className="flex items-center justify-between border-b border-(--border) px-5 py-4">
-        <span className="text-[11px] font-semibold tracking-wider text-(--text-muted)">BOOKMARK DETAILS</span>
+        <span className="text-[11px] font-semibold tracking-wider text-(--text-muted)">ITEM DETAILS</span>
         <IconButton onClick={onClose} aria-label="Close bookmark details" className="rounded-full">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <line x1="18" y1="6" x2="6" y2="18" />
@@ -334,7 +334,7 @@ export default function DetailPanel({
             <button
               onClick={() => onAskAboutThis(bookmark.title)}
               className="focus-ring flex items-center justify-center gap-2 rounded-[10px] border border-(--accent)/30 px-3 py-2.5 text-xs font-semibold text-(--accent) outline-none transition-opacity duration-150 hover:opacity-90"
-              style={{ background: "linear-gradient(135deg, color-mix(in srgb, #8b5cf6 15%, transparent), color-mix(in srgb, #6366f1 15%, transparent))" }}
+              style={{ background: "linear-gradient(135deg, color-mix(in srgb, var(--brand-from) 15%, transparent), color-mix(in srgb, var(--brand-to) 15%, transparent))" }}
             >
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" aria-hidden="true">
                 <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
@@ -351,7 +351,7 @@ export default function DetailPanel({
     <div
       onClick={onClose}
       className="fixed inset-0 z-150 flex justify-end backdrop-blur-sm"
-      style={{ background: "rgba(0, 0, 0, 0.4)", animation: "fadeIn var(--transition-fast) ease-out" }}
+      style={{ background: "var(--overlay)", animation: "fadeIn var(--transition-fast) ease-out" }}
     >
       {content}
     </div>

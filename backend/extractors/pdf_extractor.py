@@ -7,6 +7,10 @@ from pypdf.errors import PdfReadError
 
 from extractors.base import ExtractedContent, ExtractionError
 
+# Below this much extractable text a PDF is treated as unreadable (scanned or
+# image-only) rather than enriched from a handful of stray characters.
+MIN_USABLE_CHARS = 200
+
 
 def extract_pdf(data: bytes, file_name: str) -> ExtractedContent:
     try:
@@ -36,12 +40,15 @@ def extract_pdf(data: bytes, file_name: str) -> ExtractedContent:
 
     page_count = len(reader.pages)
 
-    if not pages:
+    full_text = "\n\n".join(text for _, text in pages)
+
+    # A scanned PDF often still carries a few stray characters from an OCR layer
+    # or a text watermark, so "no pages at all" is too weak a test — require
+    # enough text to actually be worth summarizing and embedding.
+    if len(full_text.strip()) < MIN_USABLE_CHARS:
         raise ExtractionError(
             "No readable text was found in this PDF — it may be a scanned or image-only document."
         )
-
-    full_text = "\n\n".join(text for _, text in pages)
 
     # PDF metadata title if present, else filename.
     title = ""

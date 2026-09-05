@@ -24,7 +24,7 @@ export default function SettingsDrawer({
     <div
       onClick={onClose}
       className="fixed inset-0 z-150 flex justify-end backdrop-blur-sm"
-      style={{ background: "rgba(0, 0, 0, 0.4)", animation: "fadeIn var(--transition-fast) ease-out" }}
+      style={{ background: "var(--overlay)", animation: "fadeIn var(--transition-fast) ease-out" }}
     >
       <div
         onClick={e => e.stopPropagation()}
@@ -55,8 +55,8 @@ export default function SettingsDrawer({
               </p>
               <label
                 id="import-btn"
-                className="flex cursor-pointer items-center justify-center gap-2 rounded-[10px] border-none px-3.5 py-2.5 text-xs font-semibold text-white transition-opacity duration-150 hover:opacity-90"
-                style={{ background: "linear-gradient(135deg, #8b5cf6, #6366f1)" }}
+                className="flex cursor-pointer items-center justify-center gap-2 rounded-[10px] border-none px-3.5 py-2.5 text-xs font-semibold text-(--on-accent) transition-opacity duration-150 hover:opacity-90"
+                style={{ background: "var(--brand-gradient)" }}
               >
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                   <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" />

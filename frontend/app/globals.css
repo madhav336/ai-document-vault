@@ -1,24 +1,81 @@
 @import "tailwindcss";
 
+/* ─────────────────────────────────────────────────────────────────────────
+   Theming
+
+   Every token below is declared exactly once, as light-dark(light, dark).
+   Which half applies is decided by the used `color-scheme`, so switching
+   themes means flipping one property on <html> — no duplicated palette to
+   drift, and no per-component `dark:` variants.
+
+     no data-theme      -> follows the OS (color-scheme: light dark)
+     data-theme="dark"  -> forced dark
+     data-theme="light" -> forced light
+
+   The inline script in layout.tsx sets data-theme="dark" when the user has
+   no stored preference, so dark is the product default while "System" is
+   still a real choice.
+   ───────────────────────────────────────────────────────────────────────── */
 :root {
-  --bg: #f7f7f9;
-  --sidebar-bg: #fbfbfc;
-  --surface: #ffffff;
-  --surface-hover: #f4f4f6;
-  --border: rgba(24, 24, 27, 0.08);
-  --accent: #6366f1;
-  --accent-2: #8b5cf6;
-  --text: #18181b;
-  --text-muted: #9a9aa2;
-  --text-secondary: #52525b;
+  color-scheme: light dark;
+
+  /* Surfaces */
+  --bg:             light-dark(#f7f7f9, #0f0f11);
+  --sidebar-bg:     light-dark(#fbfbfc, #141416);
+  --surface:        light-dark(#ffffff, #1a1a1e);
+  --surface-hover:  light-dark(#f4f4f6, #232328);
+  --surface-raised: light-dark(#ffffff, #202026);
+  /* Dialogs and side panels sit one step above cards. In light they are all
+     white and shadows do the separating; in dark two near-identical greys read
+     as one flat plane, so the raised surface is measurably lighter. */
+  --surface-overlay:light-dark(#ffffff, #202026);
+  /* Form fields are recessed rather than raised — on dark, an input painted the
+     same grey as the dialog behind it disappears down to its 1px border. */
+  --input-bg:       light-dark(#ffffff, #131317);
+
+  /* The composer is deliberately lifted off the page background in dark and
+     inset into it in light — it reads as the focal element either way. */
+  --composer-bg:    light-dark(#ffffff, #232328);
+  --chip-bg:        light-dark(#f4f4f6, #26262c);
+
+  /* Lines */
+  --border:         light-dark(rgba(24, 24, 27, 0.08), rgba(255, 255, 255, 0.09));
+  --border-strong:  light-dark(rgba(24, 24, 27, 0.14), rgba(255, 255, 255, 0.17));
+
+  /* Brand.
+     The light accent is indigo-600 rather than indigo-500: at 500 it measured
+     4.47:1 both as text on white and as the backing for white text — just under
+     AA on both counts, in a colour used for every active nav row and chip. */
+  --accent:         light-dark(#4f46e5, #818cf8);
+  --accent-2:       light-dark(#8b5cf6, #a78bfa);
+  /* Text drawn *on top of* a solid --accent fill. White has enough contrast on
+     the light-theme indigo; the lighter dark-theme indigo needs dark text. */
+  --on-accent:      light-dark(#ffffff, #12121a);
+  --brand-from:     light-dark(#8b5cf6, #a78bfa);
+  --brand-to:       light-dark(#4f46e5, #818cf8);
+  --brand-gradient: linear-gradient(135deg, var(--brand-from), var(--brand-to));
+
+  /* Text */
+  --text:           light-dark(#18181b, #ececee);
+  --text-secondary: light-dark(#52525b, #a1a1aa);
+  /* Muted carries counts, timestamps and section labels — all real content, all
+     at small sizes, so it has to clear 4.5:1 against the *chip* background too,
+     not just the page. The old light value measured 2.6:1. */
+  --text-muted:     light-dark(#6b6b75, #90909a);
 
   /* Semantic colors */
-  --success: #16a34a;
-  --success-bg: #f0fdf4;
-  --danger: #dc2626;
-  --danger-bg: #fef2f2;
-  --warning: #d97706;
-  --warning-bg: #fffbeb;
+  --success:        light-dark(#16a34a, #4ade80);
+  --success-bg:     light-dark(#f0fdf4, rgba(74, 222, 128, 0.13));
+  --danger:         light-dark(#dc2626, #f87171);
+  --danger-bg:      light-dark(#fef2f2, rgba(248, 113, 113, 0.13));
+  /* Text on a solid --danger fill, same reasoning as --on-accent. */
+  --on-danger:      light-dark(#ffffff, #2a0a0a);
+  --warning:        light-dark(#d97706, #fbbf24);
+  --warning-bg:     light-dark(#fffbeb, rgba(251, 191, 36, 0.13));
+
+  /* Scrims behind modals and drawers */
+  --overlay:        light-dark(rgba(0, 0, 0, 0.45), rgba(0, 0, 0, 0.68));
+  --scrollbar-thumb:light-dark(rgba(24, 24, 27, 0.15), rgba(255, 255, 255, 0.16));
 
   /* Spacing */
   --space-1: 4px;
@@ -38,14 +95,14 @@
   --text-xl: 18px;
   --text-2xl: 22px;
 
-  /* Surfaces */
-  --surface-raised: #ffffff;
-  --surface-overlay: #ffffff;
-
-  /* Shadows — soft, low-opacity, layered for a light theme */
-  --shadow-sm: 0 1px 2px rgba(24, 24, 27, 0.04), 0 1px 1px rgba(24, 24, 27, 0.03);
-  --shadow-lg: 0 12px 32px rgba(24, 24, 27, 0.08), 0 2px 8px rgba(24, 24, 27, 0.04);
-  --shadow-glow: 0 0 0 1px rgba(99, 102, 241, 0.15), 0 4px 20px rgba(99, 102, 241, 0.1);
+  /* Shadows — soft and layered in light; deeper and blacker in dark, where a
+     shadow is the only thing separating two near-identical greys. */
+  --shadow-sm: 0 1px 2px light-dark(rgba(24, 24, 27, 0.04), rgba(0, 0, 0, 0.4)),
+               0 1px 1px light-dark(rgba(24, 24, 27, 0.03), rgba(0, 0, 0, 0.3));
+  --shadow-lg: 0 12px 32px light-dark(rgba(24, 24, 27, 0.08), rgba(0, 0, 0, 0.55)),
+               0 2px 8px  light-dark(rgba(24, 24, 27, 0.04), rgba(0, 0, 0, 0.4));
+  --shadow-glow: 0 0 0 1px light-dark(rgba(99, 102, 241, 0.15), rgba(129, 140, 248, 0.28)),
+                 0 4px 20px light-dark(rgba(99, 102, 241, 0.10), rgba(129, 140, 248, 0.14));
 
   /* Radius */
   --radius-sm: 6px;
@@ -58,6 +115,9 @@
   --transition-smooth: 0.22s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
+:root[data-theme="dark"]  { color-scheme: dark; }
+:root[data-theme="light"] { color-scheme: light; }
+
 body {
   background: var(--bg);
   color: var(--text);
@@ -67,15 +127,17 @@ body {
 
 ::-webkit-scrollbar { width: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: rgba(24, 24, 27, 0.15); border-radius: 10px; }
+::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 10px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--accent); }
 
 select {
-  background-color: var(--surface);
-  color-scheme: light;
+  background-color: var(--input-bg);
+  color: var(--text);
 }
 select option {
-  background-color: #ffffff;
+  /* The native option list is painted by the OS, which uses the element's own
+     background — so this has to be a real colour, not the page surface. */
+  background-color: var(--input-bg);
   color: var(--text);
 }
 
@@ -113,4 +175,15 @@ select option {
 @keyframes shimmer {
   0%   { background-position: -400px 0; }
   100% { background-position: 400px 0; }
+}
+
+/* Respect the OS "reduce motion" setting: keep state changes instant rather
+   than animated, but never hide content that an animation was fading in. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

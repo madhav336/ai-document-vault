@@ -5,48 +5,56 @@ import { Show, useAuth, useUser } from "@clerk/nextjs";
 import { Bookmark, ChatMessage, VaultStats } from "./types";
 
 // Import modular components
-import Topbar from "../components/Topbar";
-import Sidebar from "../components/Sidebar";
+import MobileBar, { MOBILE_BAR_HEIGHT } from "../components/MobileBar";
+import Sidebar, { SIDEBAR_WIDTH_COLLAPSED, SIDEBAR_WIDTH_EXPANDED } from "../components/Sidebar";
 import StatsStrip from "../components/StatsStrip";
 import DetailPanel from "../components/DetailPanel";
 import SettingsDrawer from "../components/SettingsDrawer";
-import HeroSearch from "../components/HeroSearch";
+import Composer, { ComposerMode, RankedTag, SEARCH_INPUT_ID } from "../components/Composer";
 import BookmarkCard from "../components/BookmarkCard";
-import ChatDrawer from "../components/ChatDrawer";
+import Conversation from "../components/Conversation";
 import AddEditDialog from "../components/AddEditDialog";
 import LandingPage from "../components/LandingPage";
 import Button from "../components/ui/Button";
+import { useTheme } from "../components/ThemeProvider";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
 const SIDEBAR_COLLAPSED_KEY = "vault_sidebar_collapsed";
 
-const CATEGORY_COLORS: Record<string, string> = {
-  "Backend":      "#3b82f6",
-  "Frontend":     "#f43f5e",
-  "AI/ML":        "#8b5cf6",
-  "DevOps":       "#f59e0b",
-  "Database":     "#10b981",
-  "Mobile":       "#ec4899",
-  "Security":     "#ef4444",
-  "Cloud":        "#06b6d4",
-  "Productivity": "#84cc16",
-  "Programming":  "#a78bfa",
-  "Other":        "#6b7280",
+// Category colors are drawn as foreground (icon strokes, chip text) on the page
+// surface, so each needs a darker variant for the light theme and a lighter one
+// for dark — a single mid-tone would be washed out on one of them.
+const CATEGORY_COLORS: Record<string, { light: string; dark: string }> = {
+  "Backend":      { light: "#2563eb", dark: "#60a5fa" },
+  "Frontend":     { light: "#e11d48", dark: "#fb7185" },
+  "AI/ML":        { light: "#7c3aed", dark: "#a78bfa" },
+  "DevOps":       { light: "#d97706", dark: "#fbbf24" },
+  "Database":     { light: "#059669", dark: "#34d399" },
+  "Mobile":       { light: "#db2777", dark: "#f472b6" },
+  "Security":     { light: "#dc2626", dark: "#f87171" },
+  "Cloud":        { light: "#0891b2", dark: "#22d3ee" },
+  "Productivity": { light: "#65a30d", dark: "#a3e635" },
+  "Programming":  { light: "#7c3aed", dark: "#c4b5fd" },
+  "Other":        { light: "#52525b", dark: "#a1a1aa" },
 };
 
-function getCategoryColor(cat: string) {
-  if (!cat) return "#6b7280";
-  if (CATEGORY_COLORS[cat]) return CATEGORY_COLORS[cat];
-  
-  // Generate deterministic HSL color based on string hash
-  let hash = 0;
-  for (let i = 0; i < cat.length; i++) {
-    hash = cat.charCodeAt(i) + ((hash << 5) - hash);
-  }
-  const hue = Math.abs(hash % 360);
-  // Tuned for readable contrast as text on a light surface (was 65% lightness,
-  // pastel-bright — meant for a dark background).
-  return `hsl(${hue}, 65%, 42%)`;
+function buildCategoryColor(isDark: boolean) {
+  return function getCategoryColor(cat: string) {
+    const fallback = isDark ? "#a1a1aa" : "#52525b";
+    if (!cat) return fallback;
+    const known = CATEGORY_COLORS[cat];
+    if (known) return isDark ? known.dark : known.light;
+
+    // Generate deterministic HSL color based on string hash
+    let hash = 0;
+    for (let i = 0; i < cat.length; i++) {
+      hash = cat.charCodeAt(i) + ((hash << 5) - hash);
+    }
+    const hue = Math.abs(hash % 360);
+    // Same hue either way, flipped in lightness so it stays legible against
+    // whichever surface it lands on.
+    return isDark ? `hsl(${hue}, 70%, 68%)` : `hsl(${hue}, 65%, 42%)`;
+  };
 }
 
 function timeAgo(dateStr: string): string {
@@ -79,7 +87,6 @@ export default function Home() {
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isDialogOpen, setIsDialogOpen] = useState(false);
-  const [isChatOpen, setIsChatOpen] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [uploadNotice, setUploadNotice] = useState("");
 
@@ -103,6 +110,7 @@ export default function Home() {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [isChatLoading, setIsChatLoading] = useState(false);
+  const [composerMode, setComposerMode] = useState<ComposerMode>("browse");
 
   // --- Related Bookmarks State ---
   const [relatedBookmarks, setRelatedBookmarks] = useState<Bookmark[]>([]);
@@ -122,6 +130,14 @@ export default function Home() {
 
   const { user, isLoaded } = useUser();
   const { getToken } = useAuth();
+  const { resolved: resolvedTheme } = useTheme();
+
+  // Rebuilt on theme change so every consumer keeps the same
+  // `(cat) => color` signature and none of them need to know about theming.
+  const getCategoryColor = useMemo(
+    () => buildCategoryColor(resolvedTheme === "dark"),
+    [resolvedTheme]
+  );
 
   // --- Layout Responsiveness & Mounting ---
   useEffect(() => {
@@ -576,9 +592,23 @@ export default function Home() {
     }
   }
 
+  function handleSubmitAsk() {
+    sendChatMessage();
+  }
+
+  // Every "ask" entry point flips the composer rather than opening a separate
+  // surface, so there is exactly one place a question gets typed.
+  const enterAskMode = useCallback(() => {
+    setComposerMode("ask");
+    requestAnimationFrame(() => {
+      document.getElementById(SEARCH_INPUT_ID)?.focus();
+    });
+  }, []);
+
   const handleAskAboutThis = (targetTitle: string) => {
     setChatInput(`Tell me more about the resource: "${targetTitle}"`);
-    setIsChatOpen(true);
+    setSelectedBookmarkId(null);
+    enterAskMode();
   };
 
   // --- HTML Bookmarks HTML Import File Upload ---
@@ -732,14 +762,18 @@ export default function Home() {
     return ["All", ...Array.from(new Set(safeBookmarks.map(b => b.category).filter(Boolean)))];
   }, [safeBookmarks]);
 
-  const allTags = useMemo(() => {
-    const tagsSet = new Set<string>();
+  // Ranked by how much of the vault each tag actually covers, so the sidebar
+  // and the composer chips agree on which tags matter and in what order.
+  const rankedTags = useMemo<RankedTag[]>(() => {
+    const counts = new Map<string, number>();
     safeBookmarks.forEach(b => {
       if (Array.isArray(b.tags)) {
-        b.tags.forEach(t => tagsSet.add(t));
+        b.tags.forEach(t => counts.set(t, (counts.get(t) || 0) + 1));
       }
     });
-    return Array.from(tagsSet).sort();
+    return Array.from(counts.entries())
+      .map(([tag, count]) => ({ tag, count }))
+      .sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag));
   }, [safeBookmarks]);
 
   const visible = useMemo(() => {
@@ -756,9 +790,30 @@ export default function Home() {
   }, [safeBookmarks, selectedBookmarkId]);
 
   // --- Dynamic Layout Calculations ---
-  const desktopSidebarWidth = isSidebarCollapsed ? 52 : 220;
+  const isAskMode = composerMode === "ask";
+  // An empty Ask view keeps the hero composer and scrolls like the vault does;
+  // once there is a transcript the column switches to a fixed-height chat
+  // layout with the composer docked at the bottom.
+  const isConversationView = isAskMode && (chatMessages.length > 0 || isChatLoading);
+  const desktopSidebarWidth = isSidebarCollapsed ? SIDEBAR_WIDTH_COLLAPSED : SIDEBAR_WIDTH_EXPANDED;
   const showDetailRightPanel = !isMobile && selectedBookmarkId !== null;
   const rightPanelPadding = showDetailRightPanel ? 420 : 0;
+
+  // The sidebar's search affordance focuses the one input the page already owns
+  // rather than duplicating search state up here.
+  const focusSearchInput = useCallback(() => {
+    const el = document.getElementById(SEARCH_INPUT_ID) as HTMLInputElement | null;
+    el?.focus();
+    el?.scrollIntoView({ block: "center", behavior: "smooth" });
+  }, []);
+
+  const openAddDialog = useCallback(() => {
+    setEditingId(null);
+    setTitle("");
+    setUrl("");
+    setError("");
+    setIsDialogOpen(true);
+  }, []);
 
   return (
     <>
@@ -792,17 +847,16 @@ export default function Home() {
             </div>
           )}
 
-          {/* Top Header Navigation */}
-          <Topbar
-            onOpenAddDialog={() => { setEditingId(null); setTitle(""); setUrl(""); setError(""); setIsDialogOpen(true); }}
-            onOpenSettings={() => setIsSettingsOpen(true)}
-            onOpenChat={() => setIsChatOpen(true)}
-            isMobile={isMobile}
-            onToggleSidebar={() => setIsSidebarOpen(!isSidebarOpen)}
-          />
+          {/* Mobile-only chrome — the desktop shell has no top bar at all */}
+          {isMounted && isMobile && (
+            <MobileBar
+              onToggleSidebar={() => setIsSidebarOpen(!isSidebarOpen)}
+              onOpenChat={enterAskMode}
+            />
+          )}
 
           <div style={{ display: "flex", flex: 1, position: "relative" }}>
-            
+
             {/* Sidebar Menu Drawer */}
             <Sidebar
               isCollapsed={isSidebarCollapsed}
@@ -816,39 +870,73 @@ export default function Home() {
               setShowArchived={setShowArchived}
               selectedTag={selectedTag}
               setSelectedTag={setSelectedTag}
-              allTags={allTags}
+              rankedTags={rankedTags}
               isMobile={isMobile}
               isMobileOpen={isSidebarOpen}
               onCloseMobile={() => setIsSidebarOpen(false)}
               isMounted={isMounted}
+              onOpenChat={enterAskMode}
+              onOpenAdd={openAddDialog}
+              onUploadFiles={uploadFiles}
+              onOpenSettings={() => setIsSettingsOpen(true)}
+              onFocusSearch={focusSearchInput}
             />
 
             {/* Main Application Feed Column */}
             <main
               style={{
-                marginLeft: isMounted ? (isMobile ? 0 : `${desktopSidebarWidth}px`) : "220px",
+                marginLeft: isMounted ? (isMobile ? 0 : `${desktopSidebarWidth}px`) : `${SIDEBAR_WIDTH_EXPANDED}px`,
                 marginRight: isMounted ? `${rightPanelPadding}px` : 0,
                 flex: 1,
                 display: "flex",
                 flexDirection: "column",
-                minHeight: "calc(100vh - 60px)",
+                // A running conversation pins the composer to the bottom, so the
+                // column takes a definite height and scrolls internally instead
+                // of letting the whole page grow.
+                height: isConversationView
+                  ? (isMobile ? `calc(100vh - ${MOBILE_BAR_HEIGHT}px)` : "100vh")
+                  : undefined,
+                overflow: isConversationView ? "hidden" : undefined,
+                minHeight: isMounted && isMobile ? `calc(100vh - ${MOBILE_BAR_HEIGHT}px)` : "100vh",
                 position: "relative",
                 transition: "margin-left 0.2s cubic-bezier(0.16, 1, 0.3, 1), margin-right 0.2s cubic-bezier(0.16, 1, 0.3, 1)",
-                padding: isMounted ? (isMobile ? "28px 20px" : "44px 48px") : "44px 48px",
+                padding: isMounted ? (isMobile ? "24px 20px" : "40px 48px") : "40px 48px",
               }}
             >
-            <div style={{ width: "100%", maxWidth: "1360px", margin: "0 auto" }}>
-              {/* Prominent Centered Search Component */}
-              <HeroSearch
-                searchQuery={searchQuery}
-                setSearchQuery={setSearchQuery}
-                isChatOpen={isChatOpen}
-                setIsChatOpen={setIsChatOpen}
-                isMobile={isMobile}
-              />
-
-              {/* Stats Overview Summary Text Line */}
-              <StatsStrip stats={vaultStats} />
+            <div
+              style={{
+                width: "100%",
+                // Prose wants a narrower measure than a card grid does.
+                maxWidth: isAskMode ? "880px" : "1360px",
+                margin: "0 auto",
+                // Only the conversation needs a constrained flex column. Making
+                // the browse column a flex item with `flex-basis: 0` would let
+                // a tall card grid overflow instead of extending the page.
+                ...(isConversationView
+                  ? { display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }
+                  : {}),
+              }}
+            >
+              {/* One input for both jobs: semantic search and RAG chat */}
+              {!isConversationView && (
+                <Composer
+                  mode={composerMode}
+                  setMode={setComposerMode}
+                  searchQuery={searchQuery}
+                  setSearchQuery={setSearchQuery}
+                  chatInput={chatInput}
+                  setChatInput={setChatInput}
+                  onSubmitAsk={handleSubmitAsk}
+                  isChatLoading={isChatLoading}
+                  rankedTags={rankedTags}
+                  selectedTag={selectedTag}
+                  setSelectedTag={setSelectedTag}
+                  onOpenAdd={openAddDialog}
+                  onUploadFiles={uploadFiles}
+                  isMobile={isMobile}
+                  itemCount={safeBookmarks.length}
+                />
+              )}
 
               {/* Upload notice (multi-file / errors) */}
               {uploadNotice && (
@@ -864,11 +952,63 @@ export default function Home() {
                 </div>
               )}
 
-              {/* Heading Titles */}
-              <div style={{ marginBottom: "28px" }}>
-                <h2 style={{ fontSize: "22px", fontWeight: 700, color: "var(--text)", letterSpacing: "-0.4px" }}>
-                  {activeCategory === "All" ? "All Saved Resources" : activeCategory}
-                </h2>
+              {/* ── Ask mode: the conversation replaces the grid entirely ── */}
+              {isAskMode && (
+                <>
+                  <Conversation
+                    messages={chatMessages}
+                    isLoading={isChatLoading}
+                    onSelectSource={setSelectedBookmarkId}
+                    onBackToVault={() => setComposerMode("browse")}
+                    onNewConversation={() => setChatMessages([])}
+                    onUseSuggestion={prompt => {
+                      setChatInput(prompt);
+                      focusSearchInput();
+                    }}
+                    rankedTags={rankedTags}
+                    categories={categories}
+                    itemCount={safeBookmarks.length}
+                  />
+
+                  {isConversationView && (
+                    <Composer
+                      variant="docked"
+                      mode={composerMode}
+                      setMode={setComposerMode}
+                      searchQuery={searchQuery}
+                      setSearchQuery={setSearchQuery}
+                      chatInput={chatInput}
+                      setChatInput={setChatInput}
+                      onSubmitAsk={handleSubmitAsk}
+                      isChatLoading={isChatLoading}
+                      rankedTags={rankedTags}
+                      selectedTag={selectedTag}
+                      setSelectedTag={setSelectedTag}
+                      onOpenAdd={openAddDialog}
+                      onUploadFiles={uploadFiles}
+                      isMobile={isMobile}
+                      itemCount={safeBookmarks.length}
+                    />
+                  )}
+                </>
+              )}
+
+              {/* Section heading — the stats line rides along on the right
+                  instead of floating on its own row above the composer. */}
+              {!isAskMode && (
+              <div style={{ marginBottom: "24px" }}>
+                <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1.5">
+                  <h2 className="text-[20px] font-bold tracking-[-0.4px] text-(--text)">
+                    {showArchived
+                      ? "Archive"
+                      : searchQuery
+                        ? `Results for "${searchQuery}"`
+                        : activeCategory === "All"
+                          ? "All items"
+                          : activeCategory}
+                  </h2>
+                  <StatsStrip stats={vaultStats} />
+                </div>
                 {selectedTag && (
                   <div style={{ display: "flex", alignItems: "center", gap: "8px", marginTop: "10px" }}>
                     <span style={{ fontSize: "10px", color: "var(--text-muted)", fontWeight: 700, letterSpacing: "0.05em" }}>FILTERING BY TAG:</span>
@@ -890,9 +1030,10 @@ export default function Home() {
                   </div>
                 )}
               </div>
+              )}
 
               {/* Skeleton Loader Overlay */}
-              {isBookmarksLoading && visible.length === 0 && (
+              {!isAskMode && isBookmarksLoading && visible.length === 0 && (
                 <div style={{
                   display: "grid",
                   gridTemplateColumns: isMounted ? (isMobile ? "1fr" : "repeat(auto-fill, minmax(380px, 1fr))") : "repeat(auto-fill, minmax(380px, 1fr))",
@@ -915,7 +1056,7 @@ export default function Home() {
               )}
 
               {/* In-app empty states */}
-              {!isBookmarksLoading && visible.length === 0 && (
+              {!isAskMode && !isBookmarksLoading && visible.length === 0 && (
                 <div style={{ textAlign: "center", paddingTop: "80px", color: "var(--text-muted)" }}>
                   <div style={{
                     width: "64px", height: "64px", background: "var(--surface)",
@@ -960,7 +1101,7 @@ export default function Home() {
               )}
 
               {/* Bookmark Grid Layout */}
-              {!isBookmarksLoading && visible.length > 0 && (
+              {!isAskMode && !isBookmarksLoading && visible.length > 0 && (
                 <div style={{
                   display: "grid",
                   gridTemplateColumns: isMounted ? (isMobile ? "1fr" : "repeat(auto-fill, minmax(380px, 1fr))") : "repeat(auto-fill, minmax(380px, 1fr))",
@@ -1043,7 +1184,7 @@ export default function Home() {
       {/* ══════════════════════════ DELETE CONFIRM ════════════════════════════ */}
       {deleteTargetId !== null && (
         <div onClick={() => setDeleteTargetId(null)} style={{
-          position: "fixed", inset: 0, background: "rgba(0, 0, 0, 0.6)",
+          position: "fixed", inset: 0, background: "var(--overlay)",
           backdropFilter: "blur(6px)", display: "flex", alignItems: "center",
           justifyContent: "center", zIndex: 999, padding: "16px",
           animation: "fadeIn 0.2s ease-out",
@@ -1067,9 +1208,9 @@ export default function Home() {
                 <path d="M10 11v6" /><path d="M14 11v6" />
               </svg>
             </div>
-            <h2 className="mb-2 text-[17px] font-bold text-(--text)">Delete bookmark?</h2>
+            <h2 className="mb-2 text-[17px] font-bold text-(--text)">Delete this item?</h2>
             <p className="mb-6 text-[13px] leading-[1.65] text-(--text-muted)">
-              This action cannot be undone. The bookmark and its AI summary will be permanently removed.
+              This action cannot be undone. The item, its AI summary, and any uploaded file will be permanently removed.
             </p>
             <div className="flex gap-2.5">
               <Button variant="secondary" fullWidth onClick={() => setDeleteTargetId(null)}>
@@ -1077,7 +1218,7 @@ export default function Home() {
               </Button>
               <button
                 onClick={confirmDelete}
-                className="focus-ring flex-1 rounded-xl border-none px-3 py-2.5 text-sm font-semibold text-white outline-none"
+                className="focus-ring flex-1 rounded-xl border-none px-3 py-2.5 text-sm font-semibold text-(--on-danger) outline-none"
                 style={{ background: "var(--danger)" }}
               >
                 Delete
@@ -1087,17 +1228,6 @@ export default function Home() {
         </div>
       )}
 
-      {/* ══════════════════════════ AI CHAT DRAWER ════════════════════════════ */}
-      <ChatDrawer
-        isOpen={isChatOpen}
-        onClose={() => setIsChatOpen(false)}
-        chatMessages={chatMessages}
-        chatInput={chatInput}
-        setChatInput={setChatInput}
-        isChatLoading={isChatLoading}
-        isMobile={isMobile}
-        sendChatMessage={sendChatMessage}
-      />
     </>
   );
 }
