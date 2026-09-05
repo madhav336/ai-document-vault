@@ -28,7 +28,7 @@ interface AddEditDialogProps {
 const ACCEPT_UPLOAD = ".pdf,.txt,.md,.markdown,.docx";
 
 const inputClass =
-  "focus-ring w-full rounded-xl border border-(--border) bg-(--surface) px-3.5 py-2.5 text-sm text-(--text) outline-none transition-colors duration-200 font-[inherit] focus:border-(--accent)";
+  "focus-ring w-full rounded-xl border border-(--border) bg-(--input-bg) px-3.5 py-2.5 text-sm text-(--text) outline-none transition-colors duration-200 font-[inherit] placeholder:text-(--text-muted) focus:border-(--accent)";
 const labelClass = "mb-1.5 block text-[10px] font-bold tracking-[0.08em] text-(--text-muted)";
 const hintClass = "mb-0 mt-1 text-[11px] text-(--text-muted)";
 
@@ -76,7 +76,7 @@ export default function AddEditDialog({
     <div
       onClick={onClose}
       className="fixed inset-0 z-999 flex items-center justify-center p-4 backdrop-blur-[6px]"
-      style={{ background: "rgba(0, 0, 0, 0.6)", animation: "fadeIn 0.2s ease-out" }}
+      style={{ background: "var(--overlay)", animation: "fadeIn 0.2s ease-out" }}
     >
       <Card
         raised

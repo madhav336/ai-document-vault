@@ -1,7 +1,12 @@
+"use client";
+
 import React from "react";
 import { SignInButton } from "@clerk/nextjs";
 import Button from "./ui/Button";
 import Card from "./ui/Card";
+import ThemeToggle from "./ThemeToggle";
+import { useTheme } from "./ThemeProvider";
+import { clerkAppearance } from "./clerkAppearance";
 
 const FEATURES = [
   {
@@ -16,12 +21,22 @@ const FEATURES = [
   },
   {
     title: "Chat with your vault",
-    description: "Ask a question across everything you've saved and get an answer with cited sources.",
+    description: "Ask a question across everything you've saved and get an answer citing the source page.",
     icon: <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />,
   },
   {
+    title: "Links and documents",
+    description: "Save a URL or drop in a PDF, Word, Markdown, or text file — all of it becomes searchable.",
+    icon: (
+      <>
+        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+        <polyline points="14 2 14 8 20 8" />
+      </>
+    ),
+  },
+  {
     title: "Auto-summarized and tagged",
-    description: "Every link is read, summarized, and categorized automatically the moment you save it.",
+    description: "Every item is read, summarized, and categorized automatically the moment you add it.",
     icon: (
       <>
         <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" opacity="0" />
@@ -42,27 +57,35 @@ const FEATURES = [
 ];
 
 export default function LandingPage() {
+  const { resolved } = useTheme();
+
   return (
-    <div className="min-h-screen bg-[var(--bg)]">
+    <div className="relative min-h-screen bg-[var(--bg)]">
+      {/* Signed-out visitors have no sidebar, so the theme control lives here */}
+      <div className="absolute right-5 top-5">
+        <ThemeToggle />
+      </div>
+
       <div className="mx-auto flex max-w-[900px] flex-col items-center px-6 py-24 text-center">
         <div
           className="mb-7 flex h-14 w-14 items-center justify-center rounded-2xl"
-          style={{ background: "linear-gradient(135deg, #8b5cf6, #6366f1)" }}
+          style={{ background: "var(--brand-gradient)" }}
         >
-          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="var(--on-accent)" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
           </svg>
         </div>
 
         <h1 className="mb-4 max-w-[640px] text-[40px] font-bold leading-[1.15] tracking-[-0.8px] text-[var(--text)]">
-          An AI-searchable, chat-able bookmark vault
+          An AI-searchable, chat-able document vault
         </h1>
         <p className="mb-10 max-w-[540px] text-base leading-[1.7] text-[var(--text-secondary)]">
-          Save a link and it reads itself: summarized, tagged, and embedded automatically — so you can search
-          by meaning and ask your vault questions instead of scrolling through folders.
+          Save a link or drop in a document and it reads itself: summarized, tagged, and embedded
+          automatically — so you can search by meaning and ask questions across everything you&rsquo;ve
+          saved, instead of scrolling through folders.
         </p>
 
-        <SignInButton mode="modal">
+        <SignInButton mode="modal" appearance={clerkAppearance(resolved)}>
           <Button className="px-8 py-3 text-[15px]">Sign in to your vault</Button>
         </SignInButton>
 

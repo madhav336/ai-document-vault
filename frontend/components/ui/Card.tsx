@@ -7,8 +7,10 @@ interface CardProps extends React.HTMLAttributes<HTMLDivElement> {
 export default function Card({ raised = false, className = "", children, ...rest }: CardProps) {
   return (
     <div
-      className={`rounded-[14px] border border-[var(--border)] bg-[var(--surface)] ${
-        raised ? "shadow-[var(--shadow-lg)]" : "shadow-[var(--shadow-sm)]"
+      className={`rounded-[14px] border border-[var(--border)] ${
+        raised
+          ? "bg-[var(--surface-overlay)] shadow-[var(--shadow-lg)]"
+          : "bg-[var(--surface)] shadow-[var(--shadow-sm)]"
       } ${className}`}
       {...rest}
     >

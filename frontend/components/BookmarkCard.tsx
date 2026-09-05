@@ -81,7 +81,7 @@ export default function BookmarkCard({
                   className="h-4.5 w-4.5 rounded-[3px]"
                 />
                 <div
-                  className="hidden h-4.5 w-4.5 items-center justify-center rounded-[3px] text-[10px] font-bold text-white"
+                  className="hidden h-4.5 w-4.5 items-center justify-center rounded-[3px] text-[10px] font-bold text-(--on-accent)"
                   style={{ background: categoryColor }}
                 >
                   {bookmark.category ? bookmark.category[0].toUpperCase() : "U"}
@@ -161,7 +161,7 @@ export default function BookmarkCard({
               aria-pressed={active}
               className={`focus-ring whitespace-nowrap rounded-full border px-2.5 py-1 text-[11px] font-semibold outline-none transition-colors duration-150 ${
                 active
-                  ? "border-(--accent) bg-(--accent) text-white"
+                  ? "border-(--accent) bg-(--accent) text-(--on-accent)"
                   : "border-(--accent)/30 bg-(--accent)/10 text-(--accent)"
               }`}
             >
@@ -215,7 +215,7 @@ export default function BookmarkCard({
 
           <IconButton
             onClick={() => setDeleteTargetId(bookmark.id)}
-            aria-label="Delete bookmark"
+            aria-label="Delete item"
             variant="danger"
             className="h-7 w-7 rounded-md border border-(--border) bg-(--surface)"
           >

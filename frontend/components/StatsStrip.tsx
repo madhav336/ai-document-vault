@@ -8,13 +8,15 @@ interface StatsStripProps {
 export default function StatsStrip({ stats }: StatsStripProps) {
   if (!stats) return null;
 
-  const totalText = `${stats.total} link${stats.total !== 1 ? "s" : ""}`;
+  // "link" was accurate when the vault only held URLs; it now holds documents
+  // too, so the count is described in neutral terms.
+  const totalText = `${stats.total} item${stats.total !== 1 ? "s" : ""}`;
   const topicText = `${stats.category_count} topic${stats.category_count !== 1 ? "s" : ""}`;
   const recentText = `${stats.recent_30d} saved this month`;
 
   return (
     <div
-      className="mb-4 flex items-center gap-1.5 text-[11px] font-medium tracking-wide text-(--text-muted)"
+      className="flex items-center gap-1.5 text-[11px] font-medium tracking-wide text-(--text-muted)"
       style={{ animation: "fadeIn var(--transition-smooth) both" }}
     >
       <span>{totalText}</span>

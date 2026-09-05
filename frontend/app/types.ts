@@ -21,10 +21,18 @@ export type Bookmark = {
   error_reason?: string | null;
 };
 
+/**
+ * A cited item, plus the pages of it that actually contributed a retrieved
+ * passage. Empty for URLs and for formats that have no pages (txt/md/docx).
+ */
+export type ChatSource = Bookmark & {
+  cited_pages?: number[];
+};
+
 export type ChatMessage = {
   role: 'user' | 'model';
   content: string;
-  sources?: Bookmark[];
+  sources?: ChatSource[];
 };
 
 export type VaultStats = {
