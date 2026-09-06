@@ -3,7 +3,7 @@
 AI Document Vault is a full-stack AI-powered knowledge vault that ingests both web links and uploaded documents (PDF, Word, Markdown, plain text), then makes everything semantically searchable and chat-able.
 Instead of storing plain bookmarks or files, the platform enriches every item with AI-generated summaries, categories, and tags, and indexes its content for passage-level retrieval-augmented chat.
 
-Live Demo: [https://ai-bookmark-vault.vercel.app](https://ai-bookmark-vault.vercel.app)
+Live Demo: [https://ai-doc-vault.vercel.app](https://ai-doc-vault.vercel.app)
 
 ---
 

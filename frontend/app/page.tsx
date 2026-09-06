@@ -20,6 +20,9 @@ import { useTheme } from "../components/ThemeProvider";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
 const SIDEBAR_COLLAPSED_KEY = "vault_sidebar_collapsed";
+// How long to keep polling an item stuck in "processing" before assuming the
+// background job died (e.g. the host slept mid-enrichment) and standing down.
+const POLL_GIVE_UP_MS = 180_000;
 
 // Category colors are drawn as foreground (icon strokes, chip text) on the page
 // surface, so each needs a darker variant for the light theme and a lighter one
@@ -119,6 +122,10 @@ export default function Home() {
 
   // --- Deletion State ---
   const [deleteTargetId, setDeleteTargetId] = useState<number | null>(null);
+
+  // --- Enrichment polling ---
+  const [pollTick, setPollTick] = useState(0);
+  const pollStartedAtRef = useRef<{ key: string; startedAt: number } | null>(null);
 
 
 
@@ -290,11 +297,35 @@ export default function Home() {
   }, [searchQuery, searchBookmarks]);
 
   // Poll only the specific bookmark(s) still enriching, and patch them in
-  // place — avoids refetching/re-rendering the whole list every 1.5s while
-  // a background enrichment (create, edit, or reanalyze) is in flight.
+  // place — avoids refetching/re-rendering the whole list while a background
+  // enrichment (create, edit, or reanalyze) is in flight.
+  //
+  // pollTick exists because `processingIds` alone cannot re-arm this effect: if
+  // an item is *still* processing after a poll, the derived string is identical,
+  // the dependency compares equal, and polling would stop after a single attempt
+  // — leaving the card stuck on "analyzing" until a manual refresh.
   const processingIds = bookmarks.filter(b => b.status === "processing").map(b => b.id).join(",");
   useEffect(() => {
-    if (!processingIds) return;
+    if (!processingIds) {
+      pollStartedAtRef.current = null;
+      return;
+    }
+
+    // Restart the clock whenever the set of in-flight items changes.
+    if (pollStartedAtRef.current?.key !== processingIds) {
+      pollStartedAtRef.current = { key: processingIds, startedAt: Date.now() };
+    }
+    const elapsed = Date.now() - pollStartedAtRef.current.startedAt;
+
+    // Stop chasing an item the server has evidently abandoned, rather than
+    // polling a dead job forever and burning the rate limit.
+    if (elapsed > POLL_GIVE_UP_MS) return;
+
+    // Back off as the wait grows: quick feedback for a short scrape, easier on
+    // the API for a long multi-page document.
+    const delay =
+      elapsed < 15_000 ? 1_500 : elapsed < 60_000 ? 3_000 : 6_000;
+
     const ids = processingIds.split(",").map(Number);
     const timer = setTimeout(async () => {
       const token = await getToken();
@@ -316,9 +347,11 @@ export default function Home() {
         const byId = new Map(results.filter(Boolean).map(b => [b.id, b]));
         return prev.map(b => byId.get(b.id) ?? b);
       });
-    }, 1500);
+      // Re-arms the effect even when nothing about the item changed.
+      setPollTick(tick => tick + 1);
+    }, delay);
     return () => clearTimeout(timer);
-  }, [processingIds, getToken]);
+  }, [processingIds, pollTick, getToken]);
 
   // Real-time tab synchronizer channel
   useEffect(() => {

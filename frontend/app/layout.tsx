@@ -13,8 +13,17 @@ const inter = Inter({
 const title = "AI Document Vault";
 const description = "An AI-searchable, chat-able document vault — semantic search and RAG chat over your saved links and uploaded PDFs, Word, Markdown and text files, with automatic summaries and smart categorization.";
 
+// Absolute base for OG/canonical URLs. VERCEL_PROJECT_PRODUCTION_URL is injected
+// by Vercel and follows the project's real domain, so a rename can't leave social
+// previews pointing at a dead host the way a hardcoded fallback did.
+const siteUrl =
+  process.env.NEXT_PUBLIC_SITE_URL ||
+  (process.env.VERCEL_PROJECT_PRODUCTION_URL
+    ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`
+    : "http://localhost:3000");
+
 export const metadata: Metadata = {
-  metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL || "https://ai-bookmark-vault.vercel.app"),
+  metadataBase: new URL(siteUrl),
   title,
   description,
   openGraph: {
