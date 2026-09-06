@@ -72,9 +72,20 @@ else:
 # Security hardening: Strip out localhost and loopback origins in production environments
 if is_production:
     origins = [
-        o for o in origins 
+        o for o in origins
         if "localhost" not in o and "127.0.0.1" not in o and "[::1]" not in o
     ]
+
+    # A stale allowlist fails silently: the browser blocks the request, the
+    # frontend's catch renders an empty vault, and it looks like data loss
+    # rather than a misconfiguration. Say so loudly at startup instead.
+    if not allowed_origins_env:
+        logger.warning(
+            "ALLOWED_ORIGINS is not set. Falling back to the built-in origin list "
+            "%s, which will reject every other deployment URL with a CORS error. "
+            "Set ALLOWED_ORIGINS to a comma-separated list of your frontend origins.",
+            origins,
+        )
 
 app.add_middleware(
     CORSMiddleware,
